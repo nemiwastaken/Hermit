@@ -65,18 +65,36 @@ Telegram ⇄ ядро (Rust, systemd, БД SQLite)
 
 Нужны: Linux, systemd, Docker с compose, Rust (только для сборки).
 
+Без клонирования:
+
 ```sh
-git clone <этот-репозиторий> ~/hermit && cd ~/hermit
-sudo ./install/install.sh
+curl -fsSL https://raw.githubusercontent.com/nemiwastaken/Hermit/main/install.sh | sudo bash
 ```
 
-Скрипт спросит токен бота и ключ LLM, соберёт ядро, скачает и соберёт образ
-песочницы, создаст каталоги, заведёт git-репозиторий поведения, поставит
-systemd-юнит и запустит всё. Повторный запуск — это обновление: конфиг, база и
-`behavior/` не перезаписываются.
+Скрипт скачает исходники во временный каталог, соберёт ядро и образ песочницы,
+создаст каталоги, заведёт git-репозиторий поведения, поставит systemd-юнит и
+запустит всё. Спросит токен бота и ключ LLM. Временный каталог удаляется после
+установки, в системе остаётся только собранное.
 
-Флаги: `--no-start` (только разложить файлы), `--skip-build` (взять уже
-собранный бинарник), `--no-systemd` (без юнита).
+Ограничить версию или взять зеркало:
+
+```sh
+curl -fsSL <url>/install.sh | sudo HERMIT_REF=v1.2.0 bash
+curl -fsSL <url>/install.sh | sudo HERMIT_SRC=https://мой-зеркало/hermit.tar.gz bash
+```
+
+Из клона (удобнее для разработки):
+
+```sh
+git clone <этот-репозиторий> ~/hermit && cd ~/hermit
+sudo ./install.sh
+```
+
+Флаги (передаются после `--` при установке через curl):
+`--no-start` (только разложить файлы), `--skip-build` (взять уже собранный
+бинарник), `--no-systemd` (без юнита).
+
+Повторный запуск — это обновление: конфиг, база и `behavior/` не перезаписываются.
 
 После установки:
 
@@ -94,8 +112,13 @@ systemd-юнит и запустит всё. Повторный запуск —
 ### Обновление
 
 ```sh
-cd ~/hermit && git pull
-sudo ./install/install.sh
+curl -fsSL https://raw.githubusercontent.com/nemiwastaken/Hermit/main/install.sh | sudo bash
+```
+
+или из клона:
+
+```sh
+cd ~/hermit && git pull && sudo ./install.sh
 ```
 
 Тот же скрипт: собирает новую версию, пересобирает образ песочницы, подменяет
@@ -190,7 +213,8 @@ core/src/sandbox.rs     клиент сокета песочницы
 core/src/prompt.rs      системный промпт + файлы поведения
 core/src/cmd.rs         слэш-команды и флаги процесса
 sandbox/server.py       исполнение bash/read, обрезка вывода
-install/install.sh      установка в систему
+install.sh              установка и обновление в систему
+install/hermit.env.example  шаблон боевого конфига
 ```
 
 ## Протокол с песочницей

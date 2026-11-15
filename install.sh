@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Hermit installer.
 #
-#   sudo ./install/install.sh              # install or upgrade
-#   sudo ./install/install.sh --no-start   # files only, start nothing
-#   sudo ./install/install.sh --skip-build # use the already built binary
+#   sudo ./install.sh                 # from a clone: install or upgrade
+#   curl -fsSL <url>/install.sh | sudo bash   # no clone needed
+#   curl -fsSL <url>/install.sh | sudo bash -s -- --no-start
 #
-# Upgrade = run it again after `git pull`. The config, the database and
-# behavior/ are never overwritten, and the binary is swapped atomically so a
-# failure in an earlier step leaves the previous version running.
+# Upgrade = run it again. The config, the database and behavior/ are never
+# overwritten, and the binary is swapped atomically so a failure in an earlier
+# step leaves the previous version running.
 # Layout (the systemd unit assumes these default paths):
 #   /opt/hermit/bin/hermit        binary
 #   /opt/hermit/sandbox/          Dockerfile + server.py for the sandbox image
@@ -18,6 +18,21 @@
 #   /srv/hermit/workspace/        where the agent works
 
 set -euo pipefail
+
+# Piped into bash there is no checkout around us: fetch the sources and re-exec
+# from there. HERMIT_REF picks a branch/tag/commit, HERMIT_SRC a mirror tarball.
+if [ -z "${BASH_SOURCE[0]:-}" ]; then
+    REF="${HERMIT_REF:-main}"
+    SRC="${HERMIT_SRC:-https://codeload.github.com/nemiwastaken/Hermit/tar.gz/$REF}"
+    command -v curl >/dev/null || { echo "error: curl is required" >&2; exit 1; }
+    command -v tar >/dev/null || { echo "error: tar is required" >&2; exit 1; }
+    TMP="$(mktemp -d)"
+    trap 'rm -rf "$TMP"' EXIT
+    echo "== downloading Hermit ($REF)"
+    curl -fsSL "$SRC" | tar -xz -C "$TMP" --strip-components=1
+    HERMIT_GIT_REV="$REF" bash "$TMP/install.sh" "$@"
+    exit $?
+fi
 
 PREFIX="${PREFIX:-/opt/hermit}"
 CONF_DIR="${CONF_DIR:-/etc/hermit}"
@@ -34,7 +49,7 @@ while [ $# -gt 0 ]; do
         --no-systemd) NO_SYSTEMD=1 ;;
         --no-start)   NO_START=1 ;;
         --skip-build) SKIP_BUILD=1 ;;
-        -h|--help)    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)    sed -n '2,/^$/{/^$/q;p}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
     esac
     shift
@@ -44,10 +59,10 @@ say() { printf '\n== %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || die "$1 not found. $2"; }
 
-[ "$(id -u)" -eq 0 ] || die "run as root: sudo $0"
+[ "$(id -u)" -eq 0 ] || die "run as root: sudo bash $0"
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-[ -f "$REPO/compose.yml" ] || die "cannot find the repo root above $0"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$REPO/compose.yml" ] || die "cannot find the repo at $REPO"
 
 # Whose uid the sandbox container runs as, so files in the workspace belong to you.
 RUN_USER="${SUDO_USER:-}"
@@ -62,7 +77,11 @@ RUN_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 as_user() { runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" "$@"; }
 
 say "Hermit -> $PREFIX (sandbox runs as $RUN_USER:$RUN_GID)"
-GIT_REV="$(git -C "$REPO" -c safe.directory="$REPO" describe --always --dirty 2>/dev/null || echo unknown)"
+if [ -n "${HERMIT_GIT_REV:-}" ]; then
+    GIT_REV="$HERMIT_GIT_REV"
+else
+    GIT_REV="$(git -C "$REPO" -c safe.directory="$REPO" describe --always --dirty 2>/dev/null || echo unknown)"
+fi
 echo "   source: $GIT_REV"
 if [ -x "$PREFIX/bin/hermit" ]; then
     OLD_VERSION="$("$PREFIX/bin/hermit" --version 2>/dev/null || true)"
