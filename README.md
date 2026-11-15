@@ -66,7 +66,7 @@ Telegram ⇄ ядро (Rust, systemd, БД SQLite)
 - Метрики: `log_metric` пишет число или факт с ключом, `query_metrics` считает
   count/sum/avg/min/max и последние строки в SQLite — агент не выдумывает цифры.
 - Интернет: `web_search` ищет в DuckDuckGo без ключа, `web_fetch` отдаёт основной
-  текст страницы в markdown (с пагинацией `offset`). Отдельный контейнер без
+  текст страницы в markdown, а JSON/XML-API — как есть (пагинация `offset`). Отдельный контейнер без
   `/workspace` и `/behavior`, приватные адреса и metadata отбиваются на каждом
   редиректе. Браузера нет: JS-страницы и логины не читаются.
 - Защита: опасные `bash`-команды (`rm -rf`, `mkfs`, `dd`, `reboot`, …) не
