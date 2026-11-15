@@ -63,7 +63,8 @@ Telegram ⇄ ядро (Rust, systemd, БД SQLite)
 
 ## Установка
 
-Нужны: Linux, systemd, Docker с compose, Rust (только для сборки).
+Нужны: Linux, systemd, Docker с compose, Rust (только для сборки). Rust ставь
+через rustup от своего пользователя — установщик сам найдёт `cargo` в его home.
 
 Без клонирования:
 

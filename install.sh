@@ -30,7 +30,7 @@ if [ -z "${BASH_SOURCE[0]:-}" ]; then
     trap 'rm -rf "$TMP"' EXIT
     echo "== downloading Hermit ($REF)"
     curl -fsSL "$SRC" | tar -xz -C "$TMP" --strip-components=1
-    HERMIT_GIT_REV="$REF" bash "$TMP/install.sh" "$@"
+    HERMIT_PIPED=1 HERMIT_GIT_REV="$REF" bash "$TMP/install.sh" "$@"
     exit $?
 fi
 
@@ -90,8 +90,16 @@ fi
 
 # ---------------------------------------------------------------- build
 if [ "$SKIP_BUILD" -eq 0 ]; then
-    need cargo "install Rust (https://rustup.rs) or pass --skip-build"
-    as_user cargo build --release --manifest-path "$REPO/core/Cargo.toml"
+    # Piped install extracts the sources as root into a 700 temp dir; the build
+    # runs as the normal user, so hand it over.
+    if [ -n "${HERMIT_PIPED:-}" ]; then
+        chown -R "$RUN_USER:$RUN_GID" "$REPO"
+    fi
+    # Rust lives in the build user's home (rustup), rarely in root's PATH.
+    CARGO="$(as_user bash -lc 'command -v cargo' 2>/dev/null || true)"
+    [ -n "$CARGO" ] || CARGO="$RUN_HOME/.cargo/bin/cargo"
+    [ -x "$CARGO" ] || die "cargo not found for $RUN_USER. Install Rust (https://rustup.rs) or pass --skip-build"
+    as_user "$CARGO" build --release --manifest-path "$REPO/core/Cargo.toml"
 fi
 BIN="$REPO/core/target/release/hermit"
 [ -x "$BIN" ] || BIN="$PREFIX/bin/hermit"
