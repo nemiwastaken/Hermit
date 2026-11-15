@@ -157,6 +157,54 @@ pub fn check(tool: &str, safe_mode: bool) -> Result<()> {
     Ok(())
 }
 
+/// Commands that can destroy data under /workspace. Heuristic on the whole
+/// arguments blob, so it also sees inside `bash -lc "…"`; a false positive
+/// only costs one confirmation.
+const RISKY: [&str; 20] = [
+    "rm -rf",
+    "rm -fr",
+    "rm -r -f",
+    "rm -f -r",
+    "rm --recursive",
+    "mkfs",
+    "wipefs",
+    "shred",
+    "dd if=",
+    "dd of=",
+    "fdisk",
+    "parted",
+    "shutdown",
+    "reboot",
+    "poweroff",
+    "halt",
+    "chmod -r 777",
+    "chown -r",
+    "truncate -s 0",
+    "git clean -fdx",
+];
+
+/// Some(danger) when the call must be confirmed by the user first.
+pub fn approval_reason(name: &str, args: &Value) -> Option<&'static str> {
+    if name != "bash" {
+        return None;
+    }
+    // joining argv keeps both `["rm","-rf"]` and `bash -lc "rm -rf …"` visible
+    let mut blob = args["cmd"]
+        .as_array()
+        .map(|argv| {
+            argv.iter()
+                .filter_map(|a| a.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    if blob.is_empty() {
+        blob = args.to_string();
+    }
+    let blob = blob.to_lowercase();
+    RISKY.iter().copied().find(|p| blob.contains(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +220,15 @@ mod tests {
         assert!(check("query_metrics", false).is_ok());
         assert!(check("write", false).is_err());
         assert!(check("bash", true).is_err());
+    }
+
+    #[test]
+    fn flags_destructive_bash_only() {
+        let risky = json!({"cmd": ["rm", "-rf", "/workspace/tmp"]});
+        assert!(approval_reason("bash", &risky).is_some());
+        let hidden = json!({"cmd": ["bash", "-lc", "echo hi && rm -rf /workspace"]});
+        assert!(approval_reason("bash", &hidden).is_some());
+        assert!(approval_reason("bash", &json!({"cmd": ["ls", "-la"]})).is_none());
+        assert!(approval_reason("read", &json!({"path": "rm -rf"})).is_none());
     }
 }

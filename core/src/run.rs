@@ -33,6 +33,8 @@ const TRANSCRIPT_CHARS: usize = 12_000;
 const CANDIDATES: usize = 15;
 /// List size for `/sessions` and `recall()`.
 const RECALL_LIST: usize = 10;
+/// A pending approval older than this is ignored.
+pub(crate) const APPROVAL_MINUTES: i64 = 60;
 
 pub struct Agent {
     pub llm: Llm,
@@ -47,9 +49,30 @@ struct Recap {
     text: String,
 }
 
+struct Call {
+    id: String,
+    name: String,
+    args: Value,
+}
+
 impl Agent {
     /// The whole agent loop: assemble → LLM → policy → tools → repeat.
-    pub async fn reply(&self, event_id: i64, chat_id: i64, text: &str) -> Result<String> {
+    /// The second value is an approval id when a risky command needs a click.
+    pub async fn reply(
+        &self,
+        event_id: i64,
+        chat_id: i64,
+        text: &str,
+    ) -> Result<(String, Option<i64>)> {
+        if let Some(id) = self.db.approval_pending(chat_id, APPROVAL_MINUTES)? {
+            return Ok((
+                format!(
+                    "Сначала подтверди или отклони команду #{id} кнопкой в предыдущем сообщении."
+                ),
+                None,
+            ));
+        }
+
         let (mut history, updated_at) = self.db.history(chat_id)?;
         history.retain(|m| m["role"] != "system");
         let mut note = None;
@@ -112,7 +135,67 @@ impl Agent {
         history.insert(0, json!({"role": "system", "content": system}));
         history.push(json!({"role": "user", "content": text}));
 
-        for step in 0..MAX_STEPS {
+        self.run_loop(event_id, chat_id, history, note, 0).await
+    }
+
+    /// Continue after a button press. Approved runs execute the whole paused
+    /// batch, denied runs report the refusal back to the model.
+    pub async fn resume(
+        &self,
+        chat_id: i64,
+        id: i64,
+        approved: bool,
+    ) -> Result<(String, Option<i64>)> {
+        let Some(a) = self.db.approval_take(chat_id, id)? else {
+            return Ok(("Это подтверждение уже неактуально.".into(), None));
+        };
+        let stale = DateTime::parse_from_rfc3339(&a.created_at)
+            .map(|t| {
+                t.with_timezone(&Utc) < Utc::now() - chrono::Duration::minutes(APPROVAL_MINUTES)
+            })
+            .unwrap_or(false);
+        if stale {
+            return Ok((
+                format!("Подтверждение #{id} истекло, команда не выполнена."),
+                None,
+            ));
+        }
+
+        let mut history = a.history;
+        for (i, call) in a.calls.iter().enumerate() {
+            let name = call["name"].as_str().unwrap_or("");
+            let args = &call["args"];
+            let result = if approved {
+                self.run_tool(chat_id, &format!("a{}/{i}", a.id), name, args)
+                    .await
+            } else {
+                json!({"ok": false, "error": "user denied the command"})
+            };
+            eprintln!(
+                "approval #{id} {}: {name} ({})",
+                if approved { "approved" } else { "denied" },
+                a.label
+            );
+            history.push(json!({
+                "role": "tool",
+                "tool_call_id": call["id"].as_str().unwrap_or("call"),
+                "content": clamp(&result.to_string(), MAX_TOOL_CHARS),
+            }));
+        }
+        trim(&mut history);
+        self.run_loop(a.id, chat_id, history, None, a.step as usize + 1)
+            .await
+    }
+
+    async fn run_loop(
+        &self,
+        event_id: i64,
+        chat_id: i64,
+        mut history: Vec<Value>,
+        note: Option<String>,
+        start_step: usize,
+    ) -> Result<(String, Option<i64>)> {
+        for step in start_step..MAX_STEPS {
             let tools = if self.flags.safe() {
                 None
             } else {
@@ -123,7 +206,10 @@ impl Agent {
                 eprintln!("usage: {u}");
             }
             let msg = reply.message;
-            let calls = msg["tool_calls"].as_array().cloned().unwrap_or_default();
+            let calls: Vec<Call> = msg["tool_calls"]
+                .as_array()
+                .map(|a| a.iter().map(parse_call).collect())
+                .unwrap_or_default();
             history.push(msg.clone());
 
             if calls.is_empty() {
@@ -135,25 +221,36 @@ impl Agent {
                 } else {
                     content
                 };
-                return Ok(with_note(answer, note));
+                return Ok((with_note(answer, note), None));
             }
 
-            for call in calls {
-                let call_id = call["id"].as_str().unwrap_or("call").to_string();
-                let name = call["function"]["name"].as_str().unwrap_or("").to_string();
-                let raw = call["function"]["arguments"].as_str().unwrap_or("{}");
-                let args = match serde_json::from_str::<Value>(raw) {
-                    Ok(v) if v.is_object() => v,
-                    _ => json!({"__unparsable_arguments": raw}),
-                };
+            if let Some((risky, reason)) = calls
+                .iter()
+                .find_map(|c| policy::approval_reason(&c.name, &c.args).map(|r| (c, r)))
+            {
+                let label = clamp(&preview(&risky.args), 300);
+                let calls_json: Vec<Value> = calls.iter().map(call_json).collect();
+                let id =
+                    self.db
+                        .approval_add(chat_id, &calls_json, &label, step as i64, &history)?;
+                eprintln!("approval #{id} requested: {label} ({reason})");
+                let text = format!("Нужно подтверждение — {reason}.\n`{label}`");
+                return Ok((with_note(text, note), Some(id)));
+            }
 
+            for call in &calls {
                 let result = self
-                    .run_tool(chat_id, &format!("e{event_id}/{step}"), &name, &args)
+                    .run_tool(
+                        chat_id,
+                        &format!("e{event_id}/{step}"),
+                        &call.name,
+                        &call.args,
+                    )
                     .await;
-                eprintln!("tool {name} -> {}", crate::llm::brief(&result));
+                eprintln!("tool {} -> {}", call.name, crate::llm::brief(&result));
                 history.push(json!({
                     "role": "tool",
-                    "tool_call_id": call_id,
+                    "tool_call_id": call.id,
                     "content": clamp(&result.to_string(), MAX_TOOL_CHARS),
                 }));
             }
@@ -161,14 +258,20 @@ impl Agent {
         }
 
         self.db.save_history(chat_id, &history)?;
-        Ok(with_note(
-            format!("Не уложился в {MAX_STEPS} шагов, похоже на цикл. Уточни задачу или /clear."),
-            note,
+        Ok((
+            with_note(
+                format!(
+                    "Не уложился в {MAX_STEPS} шагов, похоже на цикл. Уточни задачу или /clear."
+                ),
+                note,
+            ),
+            None,
         ))
     }
 
     /// `/new`: close the active session, if any, and start clean.
     pub async fn new_session(&self, chat_id: i64) -> Result<String> {
+        self.db.approval_clear(chat_id)?;
         let (mut history, updated_at) = self.db.history(chat_id)?;
         history.retain(|m| m["role"] != "system");
         if history.is_empty() {
@@ -192,6 +295,7 @@ impl Agent {
         let Some(archived) = self.db.archived(chat_id, id)? else {
             return Ok(format!("Сессии #{id} нет. /sessions — список."));
         };
+        self.db.approval_clear(chat_id)?;
         let (mut history, updated_at) = self.db.history(chat_id)?;
         history.retain(|m| m["role"] != "system");
         if !history.is_empty() {
@@ -436,6 +540,32 @@ fn with_note(answer: String, note: Option<String>) -> String {
     match note {
         Some(n) => format!("{answer}\n\n{n}"),
         None => answer,
+    }
+}
+
+fn parse_call(call: &Value) -> Call {
+    let id = call["id"].as_str().unwrap_or("call").to_string();
+    let name = call["function"]["name"].as_str().unwrap_or("").to_string();
+    let raw = call["function"]["arguments"].as_str().unwrap_or("{}");
+    let args = match serde_json::from_str::<Value>(raw) {
+        Ok(v) if v.is_object() => v,
+        _ => json!({"__unparsable_arguments": raw}),
+    };
+    Call { id, name, args }
+}
+
+fn call_json(c: &Call) -> Value {
+    json!({"id": c.id, "name": c.name, "args": c.args})
+}
+
+fn preview(args: &Value) -> String {
+    match args["cmd"].as_array() {
+        Some(argv) => argv
+            .iter()
+            .filter_map(|a| a.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => args.to_string(),
     }
 }
 

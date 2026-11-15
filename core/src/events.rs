@@ -66,6 +66,17 @@ pub struct MetricStats {
     pub last_ts: Option<String>,
 }
 
+/// A paused run: the tool calls of one assistant message and the context
+/// before their results.
+pub struct Approval {
+    pub id: i64,
+    pub calls: Vec<Value>,
+    pub label: String,
+    pub step: i64,
+    pub history: Vec<Value>,
+    pub created_at: String,
+}
+
 /// One SQLite connection behind a mutex. The worker is serial, so a pool is
 /// pointless here; WAL still lets the telegram poller write while it runs.
 pub struct Db {
@@ -86,6 +97,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/0002_archive.sql"))?;
         conn.execute_batch(include_str!("../migrations/0003_schedules.sql"))?;
         conn.execute_batch(include_str!("../migrations/0004_metrics.sql"))?;
+        conn.execute_batch(include_str!("../migrations/0005_approvals.sql"))?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
@@ -482,6 +494,121 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn approval_add(
+        &self,
+        chat_id: i64,
+        calls: &[Value],
+        label: &str,
+        step: i64,
+        history: &[Value],
+    ) -> Result<i64> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO approvals (chat_id, calls, label, step, history, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                chat_id,
+                serde_json::to_string(calls)?,
+                label,
+                step,
+                serde_json::to_string(history)?,
+                now()
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Read and delete in one transaction: two quick clicks must not run the
+    /// command twice.
+    pub fn approval_take(&self, chat_id: i64, id: i64) -> Result<Option<Approval>> {
+        let conn = self.lock();
+        let tx = conn.unchecked_transaction()?;
+        let row = tx
+            .query_row(
+                "SELECT id, calls, label, step, history, created_at
+                 FROM approvals WHERE chat_id = ?1 AND id = ?2",
+                params![chat_id, id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, calls, label, step, history, created_at)) = row else {
+            return Ok(None);
+        };
+        tx.execute("DELETE FROM approvals WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(Some(Approval {
+            id,
+            calls: serde_json::from_str(&calls).unwrap_or_default(),
+            label,
+            step,
+            history: serde_json::from_str(&history).unwrap_or_default(),
+            created_at,
+        }))
+    }
+
+    /// The chat has to answer an old approval before a new run may start.
+    pub fn approval_pending(&self, chat_id: i64, minutes: i64) -> Result<Option<i64>> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT id FROM approvals WHERE chat_id = ?1 AND created_at >= ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![chat_id, cutoff],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn approval_clear(&self, chat_id: i64) -> Result<()> {
+        self.lock()
+            .execute("DELETE FROM approvals WHERE chat_id = ?1", params![chat_id])?;
+        Ok(())
+    }
+
+    pub fn approval_purge(&self, minutes: i64) -> Result<usize> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+        Ok(self.lock().execute(
+            "DELETE FROM approvals WHERE created_at < ?1",
+            params![cutoff],
+        )?)
+    }
+
+    pub fn dead_events(&self, limit: usize) -> Result<Vec<Event>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, payload, attempts FROM events
+             WHERE state = 'dead' ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(Event {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                payload: r.get(2)?,
+                attempts: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn requeue_event(&self, id: i64) -> Result<bool> {
+        let n = self.lock().execute(
+            "UPDATE events SET state = 'new', attempts = 0, dead_at = NULL
+             WHERE id = ?1 AND state = 'dead'",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .lock()
@@ -648,6 +775,48 @@ mod tests {
         );
         assert!(!db.schedule_delete(2, id).unwrap());
         assert!(db.schedule_delete(1, id).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn approvals_are_taken_once_and_dead_events_can_be_requeued() {
+        let (db, dir) = open("approval");
+        let calls =
+            vec![json!({"id":"c1","name":"bash","args":{"cmd":["rm","-rf","/workspace/x"]}})];
+        let hist = vec![json!({"role":"system","content":"s"})];
+        let id = db
+            .approval_add(1, &calls, "rm -rf /workspace/x", 0, &hist)
+            .unwrap();
+        assert_eq!(db.approval_pending(1, 60).unwrap(), Some(id));
+        assert_eq!(db.approval_pending(2, 60).unwrap(), None);
+
+        let a = db.approval_take(1, id).unwrap().unwrap();
+        assert_eq!(a.calls, calls);
+        assert_eq!(a.step, 0);
+        assert_eq!(a.history, hist);
+        assert!(db.approval_take(1, id).unwrap().is_none(), "taken once");
+        assert_eq!(db.approval_pending(1, 60).unwrap(), None);
+
+        // Stale rows are ignored and purged.
+        let id = db.approval_add(1, &calls, "x", 0, &hist).unwrap();
+        db.lock()
+            .execute(
+                "UPDATE approvals SET created_at = '2020-01-01T00:00:00+00:00'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.approval_pending(1, 60).unwrap(), None);
+        assert_eq!(db.approval_purge(60).unwrap(), 1);
+        assert!(db.approval_take(1, id).unwrap().is_none());
+
+        // A failed event is dead once and can go back to the queue.
+        let ev = db.push_event("message", "{}").unwrap();
+        db.claim_event().unwrap();
+        db.fail(ev, "boom").unwrap();
+        assert_eq!(db.dead_events(10).unwrap()[0].id, ev);
+        assert!(db.requeue_event(ev).unwrap());
+        assert!(db.claim_event().unwrap().is_some());
+        assert!(!db.requeue_event(ev).unwrap(), "no longer dead");
         std::fs::remove_dir_all(&dir).ok();
     }
 

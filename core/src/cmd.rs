@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::behavior;
 use crate::events::{self, Db};
-use crate::run::date;
+use crate::run::{APPROVAL_MINUTES, date};
 
 /// Process-wide switches. Deliberately not stored in the DB or `behavior/`:
 /// a restart always comes back in a known state.
@@ -83,14 +83,27 @@ pub fn handle(text: &str, flags: &Flags, db: &Db, chat_id: i64, behavior_dir: &s
                 .history(chat_id)
                 .map(|(h, _)| h.iter().filter(|m| m["role"] != "system").count())
                 .unwrap_or(0);
-            Cmd::Answer(format!(
+            let mut out = format!(
                 "пауза: {}\nsafe mode: {}\nочередь: {}\nконтекст: {context} сообщений\nархив: {} сессий",
                 yesno(flags.paused()),
                 yesno(flags.safe()),
                 db.queue_len().unwrap_or(-1),
                 db.archive_count(chat_id).unwrap_or(-1)
-            ))
+            );
+            if let Ok(Some(id)) = db.approval_pending(chat_id, APPROVAL_MINUTES) {
+                out.push_str(&format!("\nждёт подтверждения: #{id}"));
+            }
+            Cmd::Answer(out)
         }
+        "/dlq" => Cmd::Answer(dlq(db)),
+        "/retry" => match args.first().and_then(|s| s.parse::<i64>().ok()) {
+            Some(id) => Cmd::Answer(match db.requeue_event(id) {
+                Ok(true) => format!("Вернул событие #{id} в очередь."),
+                Ok(false) => format!("Мёртвого события #{id} нет."),
+                Err(e) => format!("Не смог вернуть: {e:#}"),
+            }),
+            None => Cmd::Answer("Нужен id: /retry <id>. Список — /dlq.".into()),
+        },
         "/rollback" => Cmd::Answer(report(behavior::rollback(behavior_dir))),
         "/changes" => Cmd::Answer(report(behavior::changes(behavior_dir))),
         "/memory" => Cmd::Answer(report(behavior::memory(behavior_dir))),
@@ -103,11 +116,38 @@ fn clear(db: &Db, chat_id: i64) -> String {
         .clear_history(chat_id)
         .and_then(|_| db.kv_del(&events::task_key(chat_id)))
         .and_then(|_| db.kv_del(&events::recap_key(chat_id)))
-        .and_then(|_| db.kv_del(&events::recap_id_key(chat_id)));
+        .and_then(|_| db.kv_del(&events::recap_id_key(chat_id)))
+        .and_then(|_| db.approval_clear(chat_id));
     match res {
         Ok(()) => "Контекст этого чата удалён, в архив он не попал. Архив не тронут.".into(),
         Err(e) => format!("Не смог очистить: {e:#}"),
     }
+}
+
+fn dlq(db: &Db) -> String {
+    match db.dead_events(10) {
+        Ok(rows) if rows.is_empty() => "Очередь мёртвых пуста.".into(),
+        Ok(rows) => {
+            let mut out = String::from("Мёртвые события:\n");
+            for e in rows {
+                let text = serde_json::from_str::<serde_json::Value>(&e.payload)
+                    .ok()
+                    .and_then(|v| v["text"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| e.payload.clone());
+                out.push_str(&format!("#{} {} — {}\n", e.id, e.kind, short(&text, 60)));
+            }
+            out.push_str("\n/retry <id> — вернуть в очередь.");
+            out
+        }
+        Err(e) => format!("Не смог прочитать очередь: {e:#}"),
+    }
+}
+
+fn short(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    format!("{}…", s.chars().take(max).collect::<String>())
 }
 
 fn sessions(db: &Db, chat_id: i64, args: &[&str]) -> Cmd {
@@ -233,7 +273,9 @@ const HELP: &str = "/pause — остановить обработку\n\
 /sessions — сессии: list | <id> | resume | rename | delete\n\
 /memory — профиль и скиллы\n\
 /changes — последние изменения поведения\n\
-/rollback — откатить последнее изменение агента";
+/rollback — откатить последнее изменение агента\n\
+/dlq — события, упавшие после ошибки\n\
+/retry <id> — вернуть такое событие в очередь";
 
 #[cfg(test)]
 mod tests {
@@ -300,6 +342,7 @@ mod tests {
         db.save_history(1, &h).unwrap();
         db.kv_set(&events::task_key(1), "fix docker").unwrap();
         db.kv_set(&events::recap_key(1), "recap").unwrap();
+        db.approval_add(1, &[], "rm -rf", 0, &[]).unwrap();
 
         let listed = match handle("/sessions", &f, &db, 1, beh) {
             Some(Cmd::Answer(a)) => a,
@@ -340,6 +383,18 @@ mod tests {
         assert_eq!(db.kv_get(&events::task_key(1)).unwrap(), None);
         assert_eq!(db.kv_get(&events::recap_key(1)).unwrap(), None);
         assert_eq!(db.archive_count(1).unwrap(), 1, "archive is untouched");
+        assert_eq!(
+            db.approval_pending(1, 60).unwrap(),
+            None,
+            "pending approval dropped"
+        );
+
+        assert!(
+            matches!(handle("/dlq", &f, &db, 1, beh), Some(Cmd::Answer(a)) if a.contains("пуста"))
+        );
+        assert!(
+            matches!(handle("/retry 999", &f, &db, 1, beh), Some(Cmd::Answer(a)) if a.contains("нет"))
+        );
 
         assert!(
             matches!(handle(&format!("/sessions delete {id}"), &f, &db, 1, beh), Some(Cmd::Answer(a)) if a.contains("Удалил"))

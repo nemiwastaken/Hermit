@@ -55,7 +55,6 @@ impl Tg {
             && (self.allowed_chats.contains(&chat_id) || self.allowed_users.contains(&user_id))
     }
 
-
     pub async fn poll_forever(&self, db: Arc<Db>) {
         let mut offset: i64 = db
             .kv_get("tg_offset")
@@ -91,7 +90,8 @@ impl Tg {
         let v: Value = self
             .http
             .post(format!("{}/getUpdates", self.base))
-            .json(&json!({"offset": offset, "timeout": 30, "allowed_updates": ["message"]}))
+            .json(&json!({"offset": offset, "timeout": 30,
+                          "allowed_updates": ["message", "callback_query"]}))
             .send()
             .await?
             .json()
@@ -105,6 +105,9 @@ impl Tg {
     /// The bot token is worth nothing without an allow-list; anything else that
     /// talks to it must be rejected here, before an event is created.
     async fn on_update(&self, u: &Value, db: &Db) -> Result<()> {
+        if let Some(cq) = u.get("callback_query") {
+            return self.on_callback(cq, db).await;
+        }
         let msg = &u["message"];
         let chat = &msg["chat"];
         let Some(chat_id) = chat["id"].as_i64() else {
@@ -139,25 +142,110 @@ impl Tg {
         Ok(())
     }
 
+    /// Approve/Deny button pressed. Same allow-list as messages: the click is
+    /// checked before it can create an event.
+    async fn on_callback(&self, cq: &Value, db: &Db) -> Result<()> {
+        let chat = &cq["message"]["chat"];
+        let Some(chat_id) = chat["id"].as_i64() else {
+            return Ok(());
+        };
+        let kind = chat["type"].as_str().unwrap_or("");
+        let user_id = cq["from"]["id"].as_i64().unwrap_or(0);
+        if !self.permitted(kind, chat_id, user_id) {
+            return Ok(());
+        }
+        let Some((approve, id)) = cq["data"].as_str().and_then(parse_callback) else {
+            return Ok(());
+        };
+        db.push_event(
+            "approval",
+            &json!({"chat_id": chat_id, "id": id, "approve": approve}).to_string(),
+        )?;
+        self.answer_callback(
+            cq["id"].as_str().unwrap_or(""),
+            if approve {
+                "Принято"
+            } else {
+                "Отклонено"
+            },
+        )
+        .await
+    }
+
     pub async fn send(&self, chat_id: i64, text: &str) -> Result<()> {
         for chunk in chunks(text, TG_TEXT_LIMIT) {
-            let resp = self
-                .http
-                .post(format!("{}/sendMessage", self.base))
-                .json(&json!({"chat_id": chat_id, "text": chunk, "disable_web_page_preview": true}))
-                .send()
-                .await?;
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                bail!(
-                    "sendMessage HTTP {status}: {}",
-                    body.chars().take(300).collect::<String>()
-                );
-            }
+            self.send_message(
+                json!({"chat_id": chat_id, "text": chunk, "disable_web_page_preview": true}),
+            )
+            .await?;
         }
         Ok(())
     }
+
+    /// The approval prompt: the keyboard goes on the last chunk.
+    pub async fn send_approval(&self, chat_id: i64, text: &str, id: i64) -> Result<()> {
+        let parts = chunks(text, TG_TEXT_LIMIT);
+        let last = parts.len() - 1;
+        for (i, chunk) in parts.iter().enumerate() {
+            let mut body =
+                json!({"chat_id": chat_id, "text": chunk, "disable_web_page_preview": true});
+            if i == last {
+                body["reply_markup"] = json!({"inline_keyboard": [[
+                    {"text": "✅ Выполнить", "callback_data": format!("approve:{id}")},
+                    {"text": "⛔ Отклонить", "callback_data": format!("deny:{id}")},
+                ]]});
+            }
+            self.send_message(body).await?;
+        }
+        Ok(())
+    }
+
+    async fn send_message(&self, body: Value) -> Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/sendMessage", self.base))
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!(
+                "sendMessage HTTP {status}: {}",
+                body.chars().take(300).collect::<String>()
+            );
+        }
+        Ok(())
+    }
+
+    async fn answer_callback(&self, id: &str, text: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/answerCallbackQuery", self.base))
+            .json(&json!({"callback_query_id": id, "text": text}))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!(
+                "answerCallbackQuery HTTP {status}: {}",
+                body.chars().take(300).collect::<String>()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `approve:12` / `deny:12` → verdict and id.
+fn parse_callback(data: &str) -> Option<(bool, i64)> {
+    let (verdict, id) = data.split_once(':')?;
+    let approve = match verdict {
+        "approve" => true,
+        "deny" => false,
+        _ => return None,
+    };
+    Some((approve, id.parse().ok()?))
 }
 
 /// Telegram caps a message at 4096 chars; split on newlines, hard-cut long lines.
@@ -211,6 +299,15 @@ mod tests {
         let old = tg(&[99], &[]);
         assert!(old.permitted("private", 99, 99));
         assert!(!tg(&[], &[]).permitted("private", 99, 99));
+    }
+
+    #[test]
+    fn parses_approval_callbacks() {
+        assert_eq!(parse_callback("approve:12"), Some((true, 12)));
+        assert_eq!(parse_callback("deny:3"), Some((false, 3)));
+        assert_eq!(parse_callback("approve:x"), None);
+        assert_eq!(parse_callback("nope:1"), None);
+        assert_eq!(parse_callback("approve"), None);
     }
 
     #[test]

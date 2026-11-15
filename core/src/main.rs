@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use cmd::{Cmd, Flags};
 use events::{ARCHIVE_DAYS, Db};
-use run::Agent;
+use run::{APPROVAL_MINUTES, Agent};
 use sandbox::Sandbox;
 use telegram::Tg;
 
@@ -80,6 +80,11 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
                 Ok(n) => eprintln!("purged {n} archived session(s) older than {ARCHIVE_DAYS} days"),
                 Err(e) => eprintln!("purge_archive: {e:#}"),
             }
+            match db.approval_purge(APPROVAL_MINUTES) {
+                Ok(0) => {}
+                Ok(n) => eprintln!("purged {n} stale approval(s)"),
+                Err(e) => eprintln!("approval_purge: {e:#}"),
+            }
             next_purge = Instant::now() + Duration::from_secs(3600);
         }
         // Due reminders become ordinary queue events, so they also wait while paused.
@@ -112,16 +117,28 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
         let chat_id = payload["chat_id"].as_i64().unwrap_or(0);
         let text = payload["text"].as_str().unwrap_or("").to_string();
 
-        let outcome = match cmd::handle(&text, &flags, &db, chat_id, &agent.behavior_dir) {
-            Some(Cmd::Answer(answer)) => Ok(answer),
-            Some(Cmd::NewSession) => agent.new_session(chat_id).await,
-            Some(Cmd::ResumeSession(id)) => agent.resume_session(chat_id, id).await,
-            None => agent.reply(ev.id, chat_id, &text).await,
+        let outcome: Result<(String, Option<i64>)> = if ev.kind == "approval" {
+            let id = payload["id"].as_i64().unwrap_or(0);
+            let approve = payload["approve"].as_bool().unwrap_or(false);
+            agent.resume(chat_id, id, approve).await
+        } else {
+            match cmd::handle(&text, &flags, &db, chat_id, &agent.behavior_dir) {
+                Some(Cmd::Answer(answer)) => Ok((answer, None)),
+                Some(Cmd::NewSession) => agent.new_session(chat_id).await.map(|s| (s, None)),
+                Some(Cmd::ResumeSession(id)) => {
+                    agent.resume_session(chat_id, id).await.map(|s| (s, None))
+                }
+                None => agent.reply(ev.id, chat_id, &text).await,
+            }
         };
 
         match outcome {
-            Ok(answer) => {
-                if let Err(e) = tg.send(chat_id, &answer).await {
+            Ok((answer, approval)) => {
+                let sent = match approval {
+                    Some(id) => tg.send_approval(chat_id, &answer, id).await,
+                    None => tg.send(chat_id, &answer).await,
+                };
+                if let Err(e) = sent {
                     eprintln!("reply to {chat_id}: {e:#}");
                 }
                 if let Err(e) = db.finish(ev.id) {
