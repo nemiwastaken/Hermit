@@ -1,0 +1,19 @@
+services:
+  sandbox:
+    build: ./sandbox
+    container_name: hermit-sandbox
+    restart: unless-stopped
+    # No network at all in slice 1. Add it only when a tool needs it, never for the model.
+    network_mode: none
+    user: "${HERMIT_UID:-1000}:${HERMIT_GID:-1000}"
+    environment:
+      HERMIT_WORKSPACE: /workspace
+    volumes:
+      - ${HERMIT_RUN_DIR:-./.dev/run}:/run/hermit
+      - ${HERMIT_WORKSPACE:-./.dev/workspace}:/workspace
+      - ${HERMIT_BEHAVIOR:-./.dev/behavior}:/behavior:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
