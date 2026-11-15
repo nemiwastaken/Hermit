@@ -1,3 +1,4 @@
+mod behavior;
 mod cmd;
 mod events;
 mod llm;
@@ -110,7 +111,7 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
         let chat_id = payload["chat_id"].as_i64().unwrap_or(0);
         let text = payload["text"].as_str().unwrap_or("").to_string();
 
-        let outcome = match cmd::handle(&text, &flags, &db, chat_id) {
+        let outcome = match cmd::handle(&text, &flags, &db, chat_id, &agent.behavior_dir) {
             Some(Cmd::Answer(answer)) => Ok(answer),
             Some(Cmd::NewSession) => agent.new_session(chat_id).await,
             Some(Cmd::ResumeSession(id)) => agent.resume_session(chat_id, id).await,

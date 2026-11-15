@@ -2,7 +2,13 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 /// The only tools core is allowed to ask for.
-const ALLOWED: [&str; 4] = ["bash", "read", "recall", "manage_schedule"];
+const ALLOWED: [&str; 5] = [
+    "bash",
+    "read",
+    "recall",
+    "manage_schedule",
+    "update_behavior",
+];
 
 pub fn schema() -> Value {
     json!([
@@ -80,6 +86,24 @@ pub fn schema() -> Value {
                     "required": ["action"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "update_behavior",
+                "description": "Replace one behavior file and commit it. Use it when the user asks you \
+                     to remember something about them or to change your style or skills. path is \
+                     user_profile.md or skills/<name>.md; content is the full new file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "user_profile.md or skills/<name>.md"},
+                        "content": {"type": "string", "description": "the full new file"},
+                        "note": {"type": "string", "description": "one-line reason for the commit"}
+                    },
+                    "required": ["path", "content"]
+                }
+            }
         }
     ])
 }
@@ -105,6 +129,7 @@ mod tests {
         assert!(check("read", false).is_ok());
         assert!(check("recall", false).is_ok());
         assert!(check("manage_schedule", false).is_ok());
+        assert!(check("update_behavior", false).is_ok());
         assert!(check("write", false).is_err());
         assert!(check("bash", true).is_err());
     }

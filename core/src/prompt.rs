@@ -1,5 +1,7 @@
+use crate::behavior::{PROFILE_CHARS, SKILL_CHARS};
+
 /// System prompt = fixed core base + the behavior layer, read from disk.
-/// `behavior/` is the user's own git repo; only update_behavior (slice 4) may change it.
+/// `behavior/` is the user's own git repo; only update_behavior may change it.
 pub fn system(behavior_dir: &str) -> String {
     let mut p = String::from(
         "You are Hermit, an agent running on a private home server. You act through tools, \
@@ -13,10 +15,14 @@ pub fn system(behavior_dir: &str) -> String {
          - Earlier conversations are archived. If the user asks about something that is not in \
            the current conversation, search the archive with recall(query=\"…\") instead of \
            guessing or saying there is nothing.\n\
+         - Your profile and skills live in the behavior layer. Change them with update_behavior \
+           when the user asks you to remember something about them or to change how you work; \
+           every change is committed and can be undone with /rollback. Those files are already \
+           included below, they are not in /workspace.\n\
          - If a tool fails, read the error and fix the command once; then report the failure.\n",
     );
 
-    append(&mut p, behavior_dir, "user_profile.md", 4_000);
+    append(&mut p, behavior_dir, "user_profile.md", PROFILE_CHARS);
     if let Ok(entries) = std::fs::read_dir(format!("{behavior_dir}/skills")) {
         let mut skills: Vec<_> = entries.flatten().map(|e| e.path()).collect();
         skills.sort();
@@ -25,7 +31,7 @@ pub fn system(behavior_dir: &str) -> String {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            append(&mut p, behavior_dir, &format!("skills/{name}"), 2_000);
+            append(&mut p, behavior_dir, &format!("skills/{name}"), SKILL_CHARS);
         }
     }
 

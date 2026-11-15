@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::behavior;
 use crate::events::{self, Db};
 use crate::run::date;
 
@@ -37,7 +38,7 @@ pub enum Cmd {
 
 /// Every slash command is handled here, before the model is called.
 /// None means "not a slash command, hand it to the agent".
-pub fn handle(text: &str, flags: &Flags, db: &Db, chat_id: i64) -> Option<Cmd> {
+pub fn handle(text: &str, flags: &Flags, db: &Db, chat_id: i64, behavior_dir: &str) -> Option<Cmd> {
     let t = text.trim();
     if !t.starts_with('/') {
         return None;
@@ -90,9 +91,9 @@ pub fn handle(text: &str, flags: &Flags, db: &Db, chat_id: i64) -> Option<Cmd> {
                 db.archive_count(chat_id).unwrap_or(-1)
             ))
         }
-        "/rollback" | "/changes" => {
-            Cmd::Answer("Появится на срезе 4: тогда у behavior/ будет git-история и откат.".into())
-        }
+        "/rollback" => Cmd::Answer(report(behavior::rollback(behavior_dir))),
+        "/changes" => Cmd::Answer(report(behavior::changes(behavior_dir))),
+        "/memory" => Cmd::Answer(report(behavior::memory(behavior_dir))),
         _ => Cmd::Answer(format!("Неизвестная команда {cmd}.\n\n{HELP}")),
     })
 }
@@ -211,6 +212,13 @@ fn id_arg(s: Option<&&str>) -> Option<i64> {
     s.and_then(|s| s.parse().ok())
 }
 
+fn report(r: anyhow::Result<String>) -> String {
+    match r {
+        Ok(s) => s,
+        Err(e) => format!("Не получилось: {e:#}"),
+    }
+}
+
 fn yesno(v: bool) -> &'static str {
     if v { "да" } else { "нет" }
 }
@@ -223,7 +231,9 @@ const HELP: &str = "/pause — остановить обработку\n\
 /new — закрыть диалог в архив и начать новый\n\
 /clear — удалить контекст чата, не архивируя\n\
 /sessions — сессии: list | <id> | resume | rename | delete\n\
-/rollback, /changes — срез 4";
+/memory — профиль и скиллы\n\
+/changes — последние изменения поведения\n\
+/rollback — откатить последнее изменение агента";
 
 #[cfg(test)]
 mod tests {
@@ -235,28 +245,39 @@ mod tests {
         let db = Db::open(dir.join("t.db").to_str().unwrap()).unwrap();
         (db, dir)
     }
-
     #[test]
     fn parses_commands_and_ignores_plain_text() {
         let (db, dir) = db("basic");
         let f = Flags::new(false);
+        let beh = dir.to_str().unwrap();
+        std::fs::write(dir.join("user_profile.md"), "любит кратко").unwrap();
 
-        assert!(handle("привет", &f, &db, 1).is_none());
+        assert!(handle("привет", &f, &db, 1, beh).is_none());
         assert!(
             matches!(
-                handle("/status@hermit_bot", &f, &db, 1),
+                handle("/status@hermit_bot", &f, &db, 1, beh),
                 Some(Cmd::Answer(a)) if a.contains("архив")
             ),
             "status mentions the archive"
         );
-        handle("/safe", &f, &db, 1);
+        handle("/safe", &f, &db, 1, beh);
         assert!(f.safe());
-        handle("/safe off", &f, &db, 1);
+        handle("/safe off", &f, &db, 1, beh);
         assert!(!f.safe());
         assert!(
-            matches!(handle("/nope", &f, &db, 1), Some(Cmd::Answer(a)) if a.contains("Неизвестная"))
+            matches!(handle("/nope", &f, &db, 1, beh), Some(Cmd::Answer(a)) if a.contains("Неизвестная"))
         );
-        assert!(matches!(handle("/new", &f, &db, 1), Some(Cmd::NewSession)));
+        assert!(matches!(
+            handle("/new", &f, &db, 1, beh),
+            Some(Cmd::NewSession)
+        ));
+        assert!(
+            matches!(handle("/memory", &f, &db, 1, beh), Some(Cmd::Answer(a)) if a.contains("любит кратко"))
+        );
+        assert!(
+            matches!(handle("/changes", &f, &db, 1, beh), Some(Cmd::Answer(a)) if a.contains("Не получилось")),
+            "no git repo yet"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -264,6 +285,7 @@ mod tests {
     fn sessions_subcommands_and_clear() {
         let (db, dir) = db("sessions");
         let f = Flags::new(false);
+        let beh = dir.to_str().unwrap();
         let h = vec![serde_json::json!({"role": "user", "content": "fix docker"})];
         let id = db
             .archive(
@@ -279,34 +301,40 @@ mod tests {
         db.kv_set(&events::task_key(1), "fix docker").unwrap();
         db.kv_set(&events::recap_key(1), "recap").unwrap();
 
-        let listed = match handle("/sessions", &f, &db, 1) {
+        let listed = match handle("/sessions", &f, &db, 1, beh) {
             Some(Cmd::Answer(a)) => a,
             _ => panic!("list is answered directly"),
         };
         assert!(listed.contains("Docker"), "{listed}");
 
         assert!(
-            matches!(handle(&format!("/sessions {id}"), &f, &db, 1), Some(Cmd::Answer(a)) if a.contains("fix docker"))
+            matches!(handle(&format!("/sessions {id}"), &f, &db, 1, beh), Some(Cmd::Answer(a)) if a.contains("fix docker"))
         );
         assert!(
-            matches!(handle(&format!("/sessions resume {id}"), &f, &db, 1), Some(Cmd::ResumeSession(n)) if n == id)
+            matches!(handle(&format!("/sessions resume {id}"), &f, &db, 1, beh), Some(Cmd::ResumeSession(n)) if n == id)
         );
         assert!(
-            matches!(handle("/sessions resume", &f, &db, 1), Some(Cmd::Answer(a)) if a.contains("Нужен id"))
+            matches!(handle("/sessions resume", &f, &db, 1, beh), Some(Cmd::Answer(a)) if a.contains("Нужен id"))
         );
         assert!(
-            matches!(handle("/sessions wat", &f, &db, 1), Some(Cmd::Answer(a)) if a.contains("Не понимаю"))
+            matches!(handle("/sessions wat", &f, &db, 1, beh), Some(Cmd::Answer(a)) if a.contains("Не понимаю"))
         );
 
         // rename keeps the case the user typed
-        handle(&format!("/sessions rename {id} Docker Fix"), &f, &db, 1);
+        handle(
+            &format!("/sessions rename {id} Docker Fix"),
+            &f,
+            &db,
+            1,
+            beh,
+        );
         assert_eq!(
             db.archived(1, id).unwrap().unwrap().info.title,
             "Docker Fix"
         );
 
         assert!(
-            matches!(handle("/clear", &f, &db, 1), Some(Cmd::Answer(a)) if a.contains("удалён"))
+            matches!(handle("/clear", &f, &db, 1, beh), Some(Cmd::Answer(a)) if a.contains("удалён"))
         );
         assert!(db.history(1).unwrap().0.is_empty());
         assert_eq!(db.kv_get(&events::task_key(1)).unwrap(), None);
@@ -314,7 +342,7 @@ mod tests {
         assert_eq!(db.archive_count(1).unwrap(), 1, "archive is untouched");
 
         assert!(
-            matches!(handle(&format!("/sessions delete {id}"), &f, &db, 1), Some(Cmd::Answer(a)) if a.contains("Удалил"))
+            matches!(handle(&format!("/sessions delete {id}"), &f, &db, 1, beh), Some(Cmd::Answer(a)) if a.contains("Удалил"))
         );
         assert_eq!(db.archive_count(1).unwrap(), 0);
         std::fs::remove_dir_all(&dir).ok();

@@ -4,6 +4,7 @@ use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
 use serde_json::{Value, json};
 
+use crate::behavior;
 use crate::cmd::Flags;
 use crate::events::{self, ARCHIVE_DAYS, Archived, Db, recap_id_key, recap_key, task_key};
 use crate::llm::Llm;
@@ -217,6 +218,15 @@ impl Agent {
         }
         if name == "manage_schedule" {
             return sched::handle(&self.db, chat_id, args);
+        }
+        if name == "update_behavior" {
+            let path = args["path"].as_str().unwrap_or("");
+            let content = args["content"].as_str().unwrap_or("");
+            let note = args["note"].as_str();
+            return match behavior::update(&self.behavior_dir, path, content, note) {
+                Ok(msg) => json!({"ok": true, "result": msg}),
+                Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+            };
         }
         match self.tools.call(id, name, args).await {
             Ok(v) => v,
