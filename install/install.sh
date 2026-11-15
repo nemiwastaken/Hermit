@@ -5,7 +5,9 @@
 #   sudo ./install/install.sh --no-start   # files only, start nothing
 #   sudo ./install/install.sh --skip-build # use the already built binary
 #
-# Re-running is safe: the config, the database and behavior/ are never overwritten.
+# Upgrade = run it again after `git pull`. The config, the database and
+# behavior/ are never overwritten, and the binary is swapped atomically so a
+# failure in an earlier step leaves the previous version running.
 # Layout (the systemd unit assumes these default paths):
 #   /opt/hermit/bin/hermit        binary
 #   /opt/hermit/sandbox/          Dockerfile + server.py for the sandbox image
@@ -60,6 +62,12 @@ RUN_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 as_user() { runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" "$@"; }
 
 say "Hermit -> $PREFIX (sandbox runs as $RUN_USER:$RUN_GID)"
+GIT_REV="$(git -C "$REPO" -c safe.directory="$REPO" describe --always --dirty 2>/dev/null || echo unknown)"
+echo "   source: $GIT_REV"
+if [ -x "$PREFIX/bin/hermit" ]; then
+    OLD_VERSION="$("$PREFIX/bin/hermit" --version 2>/dev/null || true)"
+    echo "   updating existing install${OLD_VERSION:+ ($OLD_VERSION)}"
+fi
 
 # ---------------------------------------------------------------- build
 if [ "$SKIP_BUILD" -eq 0 ]; then
@@ -77,7 +85,6 @@ install -d -m 700 -o root -g root "$DATA_DIR"
 install -d -m 700 -o "$RUN_USER" -g "$RUN_GID" "$SRV_DIR/run"
 install -d -m 755 -o "$RUN_USER" -g "$RUN_GID" "$SRV_DIR/workspace"
 
-install -m 755 "$BIN" "$PREFIX/bin/hermit"
 install -m 644 "$REPO/sandbox/server.py" "$REPO/sandbox/Dockerfile" "$PREFIX/sandbox/"
 install -m 644 "$REPO/compose.yml" "$PREFIX/compose.yml"
 
@@ -145,6 +152,17 @@ if [ "$NO_START" -eq 0 ]; then
     ( cd "$PREFIX" && docker compose up -d --build )
 fi
 
+# ---------------------------------------------------------------- binary
+# Atomic swap: writing over a running executable fails with "Text file busy",
+# and a half-written binary must never be what systemd starts.
+if [ "$BIN" = "$PREFIX/bin/hermit" ]; then
+    say "binary already in place"
+else
+    say "installing the core binary"
+    install -m 755 "$BIN" "$PREFIX/bin/.hermit.new"
+    mv -f "$PREFIX/bin/.hermit.new" "$PREFIX/bin/hermit"
+fi
+
 # ---------------------------------------------------------------- service
 if [ "$NO_SYSTEMD" -eq 0 ]; then
     say "installing hermit.service"
@@ -153,7 +171,7 @@ if [ "$NO_SYSTEMD" -eq 0 ]; then
     systemctl enable hermit >/dev/null
     if [ "$NO_START" -eq 0 ]; then
         if systemctl restart hermit; then
-            echo "   running"
+            echo "   $(systemctl is-active hermit) $(date -u +%FT%TZ)"
         else
             echo "   warning: service did not start, see: journalctl -u hermit -n 50"
         fi
@@ -162,9 +180,11 @@ else
     say "systemd skipped (--no-systemd)"
 fi
 
+VERSION="$("$PREFIX/bin/hermit" --version 2>/dev/null || echo unknown)"
 cat <<EOF
 
 Hermit installed:
+  version    $VERSION ($GIT_REV)
   binary     $PREFIX/bin/hermit
   sandbox    $PREFIX/compose.yml -> container hermit-sandbox
   behavior   $PREFIX/behavior (git repo)

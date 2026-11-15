@@ -21,6 +21,10 @@ use sandbox::Sandbox;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("hermit {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     dotenvy::dotenv().ok();
     let safe_mode = std::env::args().any(|a| a == "--safe-mode");
     let db_path = env_or("DATABASE_PATH", "./data/hermit.db");
