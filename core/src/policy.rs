@@ -2,9 +2,17 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 /// The only tools core is allowed to ask for.
-const ALLOWED: [&str; 9] = [
+const ALLOWED: [&str; 17] = [
     "bash",
     "read",
+    "write",
+    "edit",
+    "patch",
+    "glob",
+    "grep",
+    "list",
+    "process_manage",
+    "execute_code",
     "recall",
     "manage_schedule",
     "update_behavior",
@@ -51,6 +59,154 @@ pub fn schema() -> Value {
                         "limit": {"type": "integer", "description": "max lines, default 200, max 2000"}
                     },
                     "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write",
+                "description": "Create or overwrite a UTF-8 file under /workspace. Parent directories are \
+                     created. Use edit for a small change in a large file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "path under /workspace"},
+                        "content": {"type": "string", "description": "full file content"}
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "description": "Replace exact text in one file. old must occur once unless replace_all \
+                     is true; include a few surrounding lines to make it unique. Nothing changes on error.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "old": {"type": "string", "description": "exact text to find, including indentation"},
+                        "new": {"type": "string", "description": "replacement; empty string deletes"},
+                        "replace_all": {"type": "boolean", "description": "replace every occurrence, default false"}
+                    },
+                    "required": ["path", "old", "new"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "patch",
+                "description": "Apply several exact old/new edits to one file in a single call. Atomic: \
+                     if any old text is missing, the file is left unchanged. Use it when one change \
+                     touches several places in the same file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "edits": {"type": "array", "items": {
+                            "type": "object",
+                            "properties": {
+                                "old": {"type": "string"},
+                                "new": {"type": "string"},
+                                "replace_all": {"type": "boolean"}
+                            },
+                            "required": ["old", "new"]
+                        }}
+                    },
+                    "required": ["path", "edits"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "glob",
+                "description": "Find files by a glob pattern under /workspace, e.g. **/*.rs. \
+                     Returns paths relative to /workspace, sorted.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "glob pattern, ** is recursive"},
+                        "path": {"type": "string", "description": "base directory, default /workspace"},
+                        "limit": {"type": "integer", "description": "max paths, default 200, max 500"}
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "description": "Search file contents with ripgrep under /workspace. Returns path, line \
+                     number and text. Use glob to narrow files, e.g. glob=\"*.rs\".",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "regular expression"},
+                        "path": {"type": "string", "description": "file or directory, default /workspace"},
+                        "glob": {"type": "string", "description": "only files matching this glob"},
+                        "case_sensitive": {"type": "boolean", "description": "default true"},
+                        "limit": {"type": "integer", "description": "max matches, default 100"}
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list",
+                "description": "List a directory under /workspace with names, types and sizes.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "default /workspace"},
+                        "hidden": {"type": "boolean", "description": "include dotfiles, default false"}
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "process_manage",
+                "description": "Run and control background processes in the sandbox. start returns an id \
+                     and a log path; output tails that log; list shows state; kill stops it. Useful \
+                     for builds or servers that outlive the 10 minute bash limit. Processes die with \
+                     the container.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["start", "list", "output", "kill"]},
+                        "cmd": {"type": "array", "items": {"type": "string"}, "description": "argv for start"},
+                        "cwd": {"type": "string", "description": "working directory for start"},
+                        "id": {"type": "integer", "description": "process id for output and kill"},
+                        "lines": {"type": "integer", "description": "tail lines for output, default 100"}
+                    },
+                    "required": ["action"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "execute_code",
+                "description": "Run a Python script in the sandbox. The script can call sandbox tools \
+                     directly: import hermit; hermit.call(\"read\", path=\"/workspace/a.txt\"). Use it \
+                     to combine many steps without spending a model turn per step. stdout and stderr \
+                     come back; nested execute_code is refused.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "description": "Python source"},
+                        "timeout_ms": {"type": "integer", "description": "default 60000, max 600000"}
+                    },
+                    "required": ["code"]
                 }
             }
         },
@@ -260,6 +416,14 @@ mod tests {
     fn denies_unknown_and_safe_mode() {
         assert!(check("bash", false).is_ok());
         assert!(check("read", false).is_ok());
+        assert!(check("write", false).is_ok());
+        assert!(check("edit", false).is_ok());
+        assert!(check("patch", false).is_ok());
+        assert!(check("glob", false).is_ok());
+        assert!(check("grep", false).is_ok());
+        assert!(check("list", false).is_ok());
+        assert!(check("process_manage", false).is_ok());
+        assert!(check("execute_code", false).is_ok());
         assert!(check("recall", false).is_ok());
         assert!(check("manage_schedule", false).is_ok());
         assert!(check("update_behavior", false).is_ok());
@@ -267,7 +431,7 @@ mod tests {
         assert!(check("query_metrics", false).is_ok());
         assert!(check("web_fetch", false).is_ok());
         assert!(check("web_search", false).is_ok());
-        assert!(check("write", false).is_err());
+        assert!(check("nope", false).is_err());
         assert!(check("bash", true).is_err());
     }
 
