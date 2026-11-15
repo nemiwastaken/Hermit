@@ -1,0 +1,25 @@
+[Unit]
+Description=Hermit core (LLM control plane)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Root: it connects to the sandbox socket and writes /var/lib/hermit.
+# Untrusted code runs in the container, never here.
+User=root
+WorkingDirectory=/opt/hermit
+EnvironmentFile=/etc/hermit/hermit.env
+ExecStart=/opt/hermit/bin/hermit
+Restart=on-failure
+RestartSec=5
+
+StateDirectory=hermit
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadWritePaths=/var/lib/hermit /srv/hermit/run
+
+[Install]
+WantedBy=multi-user.target

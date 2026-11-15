@@ -1,1 +1,5 @@
 /tmp
+/.dev
+/core/target
+/core/data
+.env
