@@ -170,10 +170,16 @@ if [ ! -f "$CONF" ]; then
     sed "${PATHS[@]}" "$REPO/install/hermit.env.example" > "$CONF"
     chmod 600 "$CONF"
 
-    if [ -t 0 ]; then
-        read -r -p "Telegram bot token: " tg_token || true
-        read -r -p "LLM API key (DeepSeek): " llm_key || true
-        read -r -p "Allowed chat ids, comma separated (blank = ask the bot for yours): " chats || true
+    # Prompts go through /dev/tty: with `curl | bash` stdin is the script itself.
+    if { exec 3</dev/tty; } 2>/dev/null; then
+        echo "   fill in now, or press enter and do it later in $CONF"
+        ask() { IFS= read -r -p "   $1" "$2" <&3 || true; printf '\n'; }
+        # Secrets stay off the screen.
+        ask_hidden() { IFS= read -rs -p "   $1" "$2" <&3 || true; printf '\n'; }
+        ask_hidden "Telegram bot token (@BotFather): " tg_token
+        ask_hidden "LLM API key (DeepSeek): " llm_key
+        ask "Allowed chat ids, comma separated [optional, blank = ask the bot]: " chats
+        exec 3<&-
         esc() { printf '%s' "$1" | sed 's/[&/\]/\\&/g'; }
         if [ -n "${tg_token:-}" ]; then
             sed -i "s|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=$(esc "$tg_token")|" "$CONF"
@@ -183,6 +189,9 @@ if [ ! -f "$CONF" ]; then
         fi
         if [ -n "${chats:-}" ]; then
             sed -i "s|^TELEGRAM_ALLOWED_CHAT_IDS=.*|TELEGRAM_ALLOWED_CHAT_IDS=$(esc "$chats")|" "$CONF"
+        fi
+        if [ -z "${tg_token:-}" ] || [ -z "${llm_key:-}" ]; then
+            echo "   warning: without a token and an API key the service will not stay up"
         fi
     else
         echo "   non-interactive: fill in $CONF afterwards"
