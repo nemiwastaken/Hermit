@@ -62,6 +62,20 @@ pub struct NewSchedule<'a> {
     pub days: Option<i64>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct UsageTotals {
+    pub calls: i64,
+    pub prompt: i64,
+    pub completion: i64,
+    pub cost: f64,
+}
+
+impl UsageTotals {
+    pub fn tokens(&self) -> i64 {
+        self.prompt + self.completion
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Metric {
     pub value_num: Option<f64>,
@@ -114,6 +128,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/0003_schedules.sql"))?;
         conn.execute_batch(include_str!("../migrations/0004_metrics.sql"))?;
         conn.execute_batch(include_str!("../migrations/0005_approvals.sql"))?;
+        conn.execute_batch(include_str!("../migrations/0006_usage.sql"))?;
         ensure_schedule_columns(&conn)?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
@@ -200,6 +215,77 @@ impl Db {
             params![chat_id, serde_json::to_string(history)?, now()],
         )?;
         Ok(())
+    }
+
+    pub fn usage_add(
+        &self,
+        chat_id: i64,
+        model: &str,
+        prompt: i64,
+        completion: i64,
+        cost: f64,
+    ) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO usage (chat_id, ts, model, prompt_tokens, completion_tokens, cost_usd)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![chat_id, now(), model, prompt, completion, cost],
+        )?;
+        Ok(())
+    }
+
+    /// Today is the local day, because that is what the user sees.
+    pub fn usage_today(&self, chat_id: i64) -> Result<UsageTotals> {
+        self.usage_row(
+            "SELECT COUNT(*), COALESCE(SUM(prompt_tokens),0), \
+                    COALESCE(SUM(completion_tokens),0), COALESCE(SUM(cost_usd),0)
+             FROM usage WHERE chat_id = ?1 AND date(ts, 'localtime') = date('now', 'localtime')",
+            params![chat_id],
+        )
+    }
+
+    pub fn usage_since(&self, chat_id: i64, days: i64) -> Result<UsageTotals> {
+        self.usage_row(
+            "SELECT COUNT(*), COALESCE(SUM(prompt_tokens),0), \
+                    COALESCE(SUM(completion_tokens),0), COALESCE(SUM(cost_usd),0)
+             FROM usage
+             WHERE chat_id = ?1 AND ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)",
+            params![chat_id, format!("-{days} days")],
+        )
+    }
+
+    pub fn usage_days(&self, chat_id: i64, days: i64) -> Result<Vec<(String, UsageTotals)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT date(ts, 'localtime') AS day, COUNT(*),
+                    COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
+                    COALESCE(SUM(cost_usd),0)
+             FROM usage
+             WHERE chat_id = ?1 AND ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+             GROUP BY day ORDER BY day DESC",
+        )?;
+        let rows = stmt.query_map(params![chat_id, format!("-{days} days")], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                UsageTotals {
+                    calls: r.get(1)?,
+                    prompt: r.get(2)?,
+                    completion: r.get(3)?,
+                    cost: r.get(4)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn usage_row(&self, sql: &str, params: impl rusqlite::Params) -> Result<UsageTotals> {
+        Ok(self.lock().query_row(sql, params, |r| {
+            Ok(UsageTotals {
+                calls: r.get(0)?,
+                prompt: r.get(1)?,
+                completion: r.get(2)?,
+                cost: r.get(3)?,
+            })
+        })?)
     }
 
     pub fn clear_history(&self, chat_id: i64) -> Result<()> {
@@ -711,6 +797,10 @@ pub fn task_key(chat_id: i64) -> String {
     format!("task:{chat_id}")
 }
 
+pub fn summary_key(chat_id: i64) -> String {
+    format!("summary:{chat_id}")
+}
+
 pub fn recap_key(chat_id: i64) -> String {
     format!("recap:{chat_id}")
 }
@@ -872,6 +962,22 @@ mod tests {
         assert!(db.requeue_event(ev).unwrap());
         assert!(db.claim_event().unwrap().is_some());
         assert!(!db.requeue_event(ev).unwrap(), "no longer dead");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn usage_is_summed_per_chat() {
+        let (db, dir) = open("usage");
+        db.usage_add(1, "m", 100, 50, 0.01).unwrap();
+        db.usage_add(1, "m", 200, 25, 0.02).unwrap();
+        db.usage_add(2, "m", 999, 999, 9.0).unwrap();
+        let today = db.usage_today(1).unwrap();
+        assert_eq!(today.calls, 2);
+        assert_eq!(today.prompt, 300);
+        assert_eq!(today.completion, 75);
+        assert!((today.cost - 0.03).abs() < 1e-9);
+        assert_eq!(db.usage_since(1, 7).unwrap().tokens(), 375);
+        assert_eq!(db.usage_days(1, 7).unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 

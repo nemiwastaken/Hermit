@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 /// The only tools core is allowed to ask for.
-const ALLOWED: [&str; 17] = [
+const ALLOWED: [&str; 19] = [
     "bash",
     "read",
     "write",
@@ -14,6 +14,8 @@ const ALLOWED: [&str; 17] = [
     "process_manage",
     "execute_code",
     "recall",
+    "memory",
+    "skill",
     "manage_schedule",
     "update_behavior",
     "log_metric",
@@ -229,6 +231,39 @@ pub fn schema() -> Value {
         {
             "type": "function",
             "function": {
+                "name": "memory",
+                "description": "Store a durable fact about the user or this server in MEMORY.md. \
+                     add appends a line; replace rewrites the first line containing old; remove \
+                     drops lines containing text. Every change is committed and /rollback undoes it. \
+                     Do not store transient details.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["add", "replace", "remove"]},
+                        "text": {"type": "string", "description": "the fact, or text to remove"},
+                        "old": {"type": "string", "description": "substring of the line to replace"}
+                    },
+                    "required": ["action", "text"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "skill",
+                "description": "Read the full instructions of a skill listed in the system prompt. \
+                     Call this before doing that kind of work; the prompt carries only the one-line \
+                     description.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "manage_schedule",
                 "description": "Create, list or delete reminders. The current local time is at the end of \
                      the system prompt; all times here are local. For create pass exactly one of at, \
@@ -424,6 +459,8 @@ mod tests {
         assert!(check("list", false).is_ok());
         assert!(check("process_manage", false).is_ok());
         assert!(check("execute_code", false).is_ok());
+        assert!(check("memory", false).is_ok());
+        assert!(check("skill", false).is_ok());
         assert!(check("recall", false).is_ok());
         assert!(check("manage_schedule", false).is_ok());
         assert!(check("update_behavior", false).is_ok());

@@ -7,14 +7,16 @@ use anyhow::{Context, Result, bail};
 /// Same caps as prompt.rs: a longer file would be silently truncated there.
 pub const PROFILE_CHARS: usize = 4_000;
 pub const SKILL_CHARS: usize = 2_000;
+pub const MEMORY_CHARS: usize = 6_000;
 /// Commits made by the agent carry this author, so /rollback knows what it may undo.
 const AUTHOR: &str = "Hermit";
 
 pub fn update(dir: &str, path: &str, content: &str, note: Option<&str>) -> Result<String> {
     let cap = match path {
-        "user_profile.md" => PROFILE_CHARS,
+        "USER.md" | "user_profile.md" => PROFILE_CHARS,
+        "MEMORY.md" => MEMORY_CHARS,
         p if skill_path(p) => SKILL_CHARS,
-        _ => bail!("only user_profile.md and skills/<name>.md can be changed"),
+        _ => bail!("only USER.md, user_profile.md, MEMORY.md and skills/<name>.md can be changed"),
     };
     let len = content.chars().count();
     if len > cap {
@@ -120,15 +122,32 @@ pub fn changes(dir: &str) -> Result<String> {
     Ok(out)
 }
 
-/// What the agent currently has in its profile and skills.
+/// The profile is USER.md in new installs and user_profile.md in older ones.
+pub fn profile_file(dir: &str) -> &'static str {
+    if Path::new(dir).join("USER.md").exists() {
+        "USER.md"
+    } else {
+        "user_profile.md"
+    }
+}
+
+/// What the agent currently has in its profile, memory and skills.
 pub fn memory(dir: &str) -> Result<String> {
-    let profile = fs::read_to_string(Path::new(dir).join("user_profile.md")).unwrap_or_default();
+    let profile = fs::read_to_string(Path::new(dir).join(profile_file(dir))).unwrap_or_default();
     let profile = profile.trim();
     let mut out = String::from("Профиль:\n");
     if profile.is_empty() {
         out.push_str("(пусто)");
     } else {
         out.push_str(&clamp(profile, 1_500));
+    }
+
+    let stored = fs::read_to_string(Path::new(dir).join("MEMORY.md")).unwrap_or_default();
+    out.push_str("\n\nПамять:\n");
+    if stored.trim().is_empty() {
+        out.push_str("(пусто)");
+    } else {
+        out.push_str(&clamp(stored.trim(), 2_000));
     }
 
     let mut skills: Vec<String> = fs::read_dir(Path::new(dir).join("skills"))
@@ -146,6 +165,83 @@ pub fn memory(dir: &str) -> Result<String> {
         out.push_str(&skills.join(", "));
     }
     Ok(out)
+}
+
+/// One skill body, capped like the prompt used to cap it. The name is checked
+/// before it touches the filesystem.
+pub fn read_skill(dir: &str, name: &str) -> Result<String> {
+    let name = name.trim().trim_end_matches(".md");
+    if name.is_empty() || !skill_path(&format!("skills/{name}.md")) {
+        bail!("unknown skill `{name}`");
+    }
+    let path = Path::new(dir).join("skills").join(format!("{name}.md"));
+    let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(clamp(text.trim(), SKILL_CHARS))
+}
+
+/// Store a durable fact in MEMORY.md. Everything goes through update(), so it
+/// is committed and /rollback can undo it.
+pub fn remember(dir: &str, action: &str, text: &str, old: Option<&str>) -> Result<String> {
+    let path = Path::new(dir).join("MEMORY.md");
+    let mut content = fs::read_to_string(&path).unwrap_or_default();
+    if content.trim().is_empty() {
+        content = "# Memory\n".into();
+    }
+    let text = text.trim();
+    let action = action.trim();
+    if text.is_empty() {
+        bail!("text is empty");
+    }
+    match action {
+        "add" => {
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(&format!("- {text}\n"));
+        }
+        "replace" => {
+            let old = old.unwrap_or("").trim();
+            if old.is_empty() {
+                bail!("old is required for replace");
+            }
+            let mut done = false;
+            let mut lines: Vec<String> = Vec::new();
+            for line in content.lines() {
+                if !done && line.contains(old) {
+                    lines.push(format!("- {text}"));
+                    done = true;
+                } else {
+                    lines.push(line.to_string());
+                }
+            }
+            if !done {
+                bail!("no memory line contains `{old}`");
+            }
+            content = lines.join("\n") + "\n";
+        }
+        "remove" => {
+            let mut done = false;
+            let mut lines: Vec<String> = Vec::new();
+            for line in content.lines() {
+                if line.contains(text) {
+                    done = true;
+                } else {
+                    lines.push(line.to_string());
+                }
+            }
+            if !done {
+                bail!("no memory line contains `{text}`");
+            }
+            content = lines.join("\n") + "\n";
+        }
+        _ => bail!("action must be add, replace or remove"),
+    }
+    update(
+        dir,
+        "MEMORY.md",
+        &content,
+        Some(&format!("memory: {action}")),
+    )
 }
 
 fn skill_path(p: &str) -> bool {
@@ -225,6 +321,64 @@ fn git(dir: &str, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_add_replace_remove_and_commit() {
+        let dir = std::env::temp_dir().join(format!("hermit-mem-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        git(dir.to_str().unwrap(), &["init", "-q", "-b", "main"]).unwrap();
+        fs::write(dir.join("USER.md"), "profile").unwrap();
+        git(dir.to_str().unwrap(), &["add", "-A"]).unwrap();
+        git(
+            dir.to_str().unwrap(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        )
+        .unwrap();
+
+        remember(dir.to_str().unwrap(), "add", "likes tea", None).unwrap();
+        assert!(
+            fs::read_to_string(dir.join("MEMORY.md"))
+                .unwrap()
+                .contains("likes tea")
+        );
+        remember(
+            dir.to_str().unwrap(),
+            "replace",
+            "likes coffee",
+            Some("tea"),
+        )
+        .unwrap();
+        let text = fs::read_to_string(dir.join("MEMORY.md")).unwrap();
+        assert!(text.contains("likes coffee") && !text.contains("tea"));
+        remember(dir.to_str().unwrap(), "remove", "coffee", None).unwrap();
+        assert!(
+            !fs::read_to_string(dir.join("MEMORY.md"))
+                .unwrap()
+                .contains("coffee")
+        );
+        assert!(
+            fs::read_to_string(dir.join("MEMORY.md"))
+                .unwrap()
+                .contains("Memory")
+        );
+
+        fs::create_dir_all(dir.join("skills")).unwrap();
+        fs::write(dir.join("skills/deploy.md"), "run make").unwrap();
+        assert_eq!(
+            read_skill(dir.to_str().unwrap(), "deploy").unwrap(),
+            "run make"
+        );
+        assert!(read_skill(dir.to_str().unwrap(), "../x").is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
     use std::path::PathBuf;
 
     fn repo(name: &str) -> (PathBuf, String) {

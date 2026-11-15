@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
         db: db.clone(),
         flags: flags.clone(),
         behavior_dir,
+        tg: tg.clone(),
     });
 
     eprintln!(
@@ -121,6 +122,7 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
         let text = payload["text"].as_str().unwrap_or("").to_string();
 
         let mut ask_after: Option<String> = None;
+        let typing = tg.typing_loop(chat_id);
         let outcome: Result<(String, Option<i64>)> = match ev.kind.as_str() {
             "approval" => {
                 let id = payload["id"].as_i64().unwrap_or(0);
@@ -151,11 +153,17 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
             _ => usual(&agent, &flags, &db, chat_id, &text, ev.id).await,
         };
 
+        typing.abort();
         match outcome {
             Ok((answer, approval)) => {
-                let sent = match approval {
-                    Some(id) => tg.send_approval(chat_id, &answer, id).await,
-                    None => tg.send(chat_id, &answer).await,
+                // An empty answer means the streamer already delivered it.
+                let sent = if answer.is_empty() {
+                    Ok(())
+                } else {
+                    match approval {
+                        Some(id) => tg.send_approval(chat_id, &answer, id).await,
+                        None => tg.send(chat_id, &answer).await,
+                    }
                 };
                 match sent {
                     Ok(()) => {
@@ -195,6 +203,7 @@ async fn usual(
         Some(Cmd::Answer(answer)) => Ok((answer, None)),
         Some(Cmd::NewSession) => agent.new_session(chat_id).await.map(|s| (s, None)),
         Some(Cmd::ResumeSession(id)) => agent.resume_session(chat_id, id).await.map(|s| (s, None)),
+        Some(Cmd::Compress) => agent.compress(chat_id).await.map(|s| (s, None)),
         None => agent.reply(event_id, chat_id, text).await,
     }
 }

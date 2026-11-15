@@ -1,5 +1,5 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -225,22 +225,85 @@ impl Tg {
         self.send_message(plain).await
     }
 
-    async fn send_message(&self, body: Value) -> Result<()> {
+    /// One Bot API method. The error keeps Telegram's description, because
+    /// "message is not modified" and "message is too long" need different
+    /// handling.
+    async fn call(&self, method: &str, body: Value) -> Result<Value> {
         let resp = self
             .http
-            .post(format!("{}/sendMessage", self.base))
+            .post(format!("{}/{method}", self.base))
             .json(&body)
             .send()
             .await?;
         let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
             bail!(
-                "sendMessage HTTP {status}: {}",
-                body.chars().take(300).collect::<String>()
+                "{method} HTTP {status}: {}",
+                text.chars().take(300).collect::<String>()
             );
         }
+        let json: Value = serde_json::from_str(&text).context("Telegram returned non-JSON")?;
+        Ok(json["result"].clone())
+    }
+
+    async fn send_message(&self, body: Value) -> Result<()> {
+        self.call("sendMessage", body).await?;
         Ok(())
+    }
+
+    async fn send_plain_id(&self, chat_id: i64, text: &str) -> Result<i64> {
+        let result = self
+            .call(
+                "sendMessage",
+                json!({"chat_id": chat_id, "text": text, "disable_web_page_preview": true}),
+            )
+            .await?;
+        Ok(result["message_id"].as_i64().unwrap_or(0))
+    }
+
+    async fn edit_plain(&self, chat_id: i64, id: i64, text: &str) -> Result<()> {
+        self.call(
+            "editMessageText",
+            json!({"chat_id": chat_id, "message_id": id, "text": text,
+                   "disable_web_page_preview": true}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn edit_formatted(&self, chat_id: i64, id: i64, chunk: &str) -> Result<()> {
+        let html = crate::md::to_html(chunk);
+        if html.encode_utf16().count() <= TG_TEXT_LIMIT {
+            let body = json!({"chat_id": chat_id, "message_id": id, "text": html,
+                              "parse_mode": "HTML", "disable_web_page_preview": true});
+            match self.call("editMessageText", body).await {
+                Ok(_) => return Ok(()),
+                Err(e) if format!("{e:#}").contains("not modified") => return Ok(()),
+                Err(e) if format!("{e:#}").contains("HTTP 400") => {
+                    eprintln!("telegram html edit: {e:#}");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.edit_plain(chat_id, id, chunk).await
+    }
+
+    /// Telegram clears "typing" after five seconds; four seconds keeps it on
+    /// through a long model call without hammering the API.
+    pub fn typing_loop(self: &Arc<Self>, chat_id: i64) -> tokio::task::JoinHandle<()> {
+        let tg = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = tg
+                    .call(
+                        "sendChatAction",
+                        json!({"chat_id": chat_id, "action": "typing"}),
+                    )
+                    .await;
+                tokio::time::sleep(Duration::from_secs(4)).await;
+            }
+        })
     }
 
     async fn answer_callback(&self, id: &str, text: &str) -> Result<()> {
@@ -274,6 +337,109 @@ fn parse_callback(data: &str) -> Option<(bool, i64)> {
 }
 
 /// Telegram caps a message at 4096 chars; split on newlines, hard-cut long lines.
+pub struct Streamer {
+    tg: Arc<Tg>,
+    chat_id: i64,
+    state: Arc<Mutex<State>>,
+}
+
+struct State {
+    text: String,
+    message_id: Option<i64>,
+    last: Instant,
+    pending: bool,
+}
+
+impl Streamer {
+    pub fn new(tg: Arc<Tg>, chat_id: i64) -> Self {
+        Self {
+            tg,
+            chat_id,
+            state: Arc::new(Mutex::new(State {
+                text: String::new(),
+                message_id: None,
+                last: Instant::now(),
+                pending: false,
+            })),
+        }
+    }
+
+    /// True once anything was shown, so a failed stream cannot be retried
+    /// silently and double-posted.
+    pub fn started(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.message_id.is_some() || !st.text.is_empty()
+    }
+
+    fn delta(&self, chunk: &str) {
+        let (snapshot, id, chat_id) = {
+            let mut st = self.state.lock().unwrap();
+            st.text.push_str(chunk);
+            let len = st.text.chars().count();
+            if st.pending || len == 0 || len > TG_TEXT_LIMIT - 500 {
+                return;
+            }
+            if st.message_id.is_none() && len < 20 {
+                return;
+            }
+            // One edit per two seconds: Telegram rate-limits edits per chat.
+            if st.message_id.is_some() && st.last.elapsed() < Duration::from_secs(2) {
+                return;
+            }
+            st.last = Instant::now();
+            st.pending = true;
+            (st.text.clone(), st.message_id, self.chat_id)
+        };
+        let tg = self.tg.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let result = match id {
+                Some(id) => tg.edit_plain(chat_id, id, &snapshot).await.map(|_| id),
+                None => tg.send_plain_id(chat_id, &snapshot).await,
+            };
+            let mut st = state.lock().unwrap();
+            st.pending = false;
+            if let Ok(id) = result {
+                st.message_id = Some(id);
+            }
+        });
+    }
+
+    /// Deliver the final text. False means "nothing was shown, send it as a
+    /// normal message"; true means the streamer owns delivery.
+    pub async fn finish(&self, text: &str) -> Result<bool> {
+        let id = {
+            let st = self.state.lock().unwrap();
+            st.message_id
+        };
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        let parts = chunks(text, TG_TEXT_LIMIT);
+        let Some(first) = parts.first() else {
+            return Ok(false);
+        };
+        let mut delivered = self.tg.edit_formatted(self.chat_id, id, first).await;
+        if delivered.is_err() {
+            delivered = self.tg.edit_plain(self.chat_id, id, first).await;
+        }
+        if let Err(e) = delivered {
+            eprintln!("stream finish: {e:#}");
+            return Ok(false);
+        }
+        for part in parts.iter().skip(1) {
+            self.tg.send(self.chat_id, part).await?;
+        }
+        Ok(true)
+    }
+}
+
+impl crate::llm::Sink for Streamer {
+    fn delta(&self, text: &str) {
+        Streamer::delta(self, text);
+    }
+}
+
 pub fn chunks(text: &str, max: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();

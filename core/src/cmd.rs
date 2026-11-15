@@ -35,6 +35,8 @@ pub enum Cmd {
     NewSession,
     /// Archive the active session, then reopen the given archived one.
     ResumeSession(i64),
+    /// Replace the transcript with a summary and the last exchange.
+    Compress,
 }
 
 /// Every slash command is handled here, before the model is called.
@@ -79,6 +81,16 @@ pub fn handle(text: &str, flags: &Flags, db: &Db, chat_id: i64, behavior_dir: &s
         "/clear" => Cmd::Answer(clear(db, chat_id)),
         "/new" => Cmd::NewSession,
         "/sessions" => sessions(db, chat_id, &args),
+        "/compress" => Cmd::Compress,
+        "/usage" => Cmd::Answer(usage(db, chat_id)),
+        "/insights" => {
+            let days = args
+                .first()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(7)
+                .clamp(1, 30);
+            Cmd::Answer(insights(db, chat_id, days))
+        }
         "/status" => {
             let context = db
                 .history(chat_id)
@@ -113,6 +125,55 @@ pub fn handle(text: &str, flags: &Flags, db: &Db, chat_id: i64, behavior_dir: &s
         "/memory" => Cmd::Answer(report(behavior::memory(behavior_dir))),
         _ => Cmd::Answer(format!("Неизвестная команда {cmd}.\n\n{HELP}")),
     })
+}
+
+fn usage(db: &Db, chat_id: i64) -> String {
+    let today = match db.usage_today(chat_id) {
+        Ok(v) => v,
+        Err(e) => return format!("Не смог прочитать расход: {e:#}"),
+    };
+    let week = match db.usage_since(chat_id, 7) {
+        Ok(v) => v,
+        Err(e) => return format!("Не смог прочитать расход: {e:#}"),
+    };
+    let mut out = format!("Сегодня: {}\nЗа 7 дней: {}\n", line(&today), line(&week));
+    if today.cost == 0.0 && week.cost == 0.0 {
+        out.push_str(
+            "Стоимость не считается: задай LLM_PRICE_IN_PER_M и LLM_PRICE_OUT_PER_M \
+             (USD за миллион токенов).",
+        );
+    }
+    out
+}
+
+fn insights(db: &Db, chat_id: i64, days: i64) -> String {
+    let rows = match db.usage_days(chat_id, days) {
+        Ok(v) => v,
+        Err(e) => return format!("Не смог прочитать расход: {e:#}"),
+    };
+    if rows.is_empty() {
+        return format!("За {days} дней вызовов модели не было.");
+    }
+    let mut out = format!("Расход за {days} дней:\n");
+    for (day, u) in rows {
+        out.push_str(&format!("{day}  {}\n", line(&u)));
+    }
+    out
+}
+
+fn line(u: &events::UsageTotals) -> String {
+    let cost = if u.cost > 0.0 {
+        format!("${:.4}", u.cost)
+    } else {
+        "цена не настроена".into()
+    };
+    format!(
+        "{} вызовов, {} токенов ({} вход + {} выход), {cost}",
+        u.calls,
+        u.tokens(),
+        u.prompt,
+        u.completion
+    )
 }
 
 fn clear(db: &Db, chat_id: i64) -> String {
@@ -276,7 +337,10 @@ const HELP: &str = "/pause — остановить обработку\n\
 /new — закрыть диалог в архив и начать новый\n\
 /clear — удалить контекст чата, не архивируя\n\
 /sessions — сессии: list | <id> | resume | rename | delete\n\
-/memory — профиль и скиллы\n\
+/memory — профиль, память и скиллы\n\
+/compress — сжать контекст в сводку\n\
+/usage — токены и стоимость за сегодня и 7 дней\n\
+/insights [дней] — расход по дням\n\
 /changes — последние изменения поведения\n\
 /rollback — откатить последнее изменение агента\n\
 /dlq — события, упавшие после ошибки\n\
