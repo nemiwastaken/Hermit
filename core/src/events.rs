@@ -37,6 +37,15 @@ pub struct ArchivedFull {
     pub history: Vec<Value>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Schedule {
+    pub id: i64,
+    pub chat_id: i64,
+    pub text: String,
+    pub next_at: String,
+    pub repeat: String,
+}
+
 /// One SQLite connection behind a mutex. The worker is serial, so a pool is
 /// pointless here; WAL still lets the telegram poller write while it runs.
 pub struct Db {
@@ -55,6 +64,7 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(include_str!("../migrations/0001_init.sql"))?;
         conn.execute_batch(include_str!("../migrations/0002_archive.sql"))?;
+        conn.execute_batch(include_str!("../migrations/0003_schedules.sql"))?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
@@ -292,6 +302,59 @@ impl Db {
             .execute("DELETE FROM archive WHERE updated_at < ?1", params![cutoff])?)
     }
 
+    pub fn schedule_add(
+        &self,
+        chat_id: i64,
+        text: &str,
+        next_at: &str,
+        repeat: &str,
+    ) -> Result<i64> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO schedules (chat_id, text, next_at, repeat, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![chat_id, text, next_at, repeat, now()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn schedules(&self, chat_id: i64) -> Result<Vec<Schedule>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, text, next_at, repeat FROM schedules
+             WHERE chat_id = ?1 ORDER BY next_at",
+        )?;
+        let rows = stmt.query_map(params![chat_id], schedule_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Across all chats: the worker has no single chat. Oldest deadline first.
+    pub fn due_schedules(&self, now: &str) -> Result<Vec<Schedule>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, text, next_at, repeat FROM schedules
+             WHERE next_at <= ?1 ORDER BY next_at",
+        )?;
+        let rows = stmt.query_map(params![now], schedule_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn schedule_advance(&self, id: i64, next_at: &str) -> Result<()> {
+        self.lock().execute(
+            "UPDATE schedules SET next_at = ?2 WHERE id = ?1",
+            params![id, next_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn schedule_delete(&self, chat_id: i64, id: i64) -> Result<bool> {
+        let n = self.lock().execute(
+            "DELETE FROM schedules WHERE chat_id = ?1 AND id = ?2",
+            params![chat_id, id],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .lock()
@@ -331,6 +394,16 @@ impl Db {
             |r| r.get(0),
         )?)
     }
+}
+
+fn schedule_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule> {
+    Ok(Schedule {
+        id: r.get(0)?,
+        chat_id: r.get(1)?,
+        text: r.get(2)?,
+        next_at: r.get(3)?,
+        repeat: r.get(4)?,
+    })
 }
 
 fn now() -> String {
@@ -418,6 +491,36 @@ mod tests {
         db.save_history(1, &h).unwrap();
         assert!(db.history(1).unwrap().1.is_some());
         assert_eq!(db.history(1).unwrap().0, h);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn schedules_roundtrip_due_and_isolation() {
+        let (db, dir) = open("sched");
+        let id = db
+            .schedule_add(1, "backup", "2026-01-01T10:00:00+00:00", "daily")
+            .unwrap();
+        assert_eq!(db.schedules(1).unwrap().len(), 1);
+        assert!(db.schedules(2).unwrap().is_empty(), "chats are isolated");
+        assert!(
+            db.due_schedules("2026-01-01T09:59:00+00:00")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.due_schedules("2026-01-02T00:00:00+00:00").unwrap()[0].id,
+            id
+        );
+        db.schedule_advance(id, "2026-01-03T10:00:00+00:00")
+            .unwrap();
+        assert!(
+            db.due_schedules("2026-01-02T12:00:00+00:00")
+                .unwrap()
+                .is_empty(),
+            "advance moves the deadline"
+        );
+        assert!(!db.schedule_delete(2, id).unwrap());
+        assert!(db.schedule_delete(1, id).unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
 

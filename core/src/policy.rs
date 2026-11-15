@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 /// The only tools core is allowed to ask for.
-const ALLOWED: [&str; 3] = ["bash", "read", "recall"];
+const ALLOWED: [&str; 4] = ["bash", "read", "recall", "manage_schedule"];
 
 pub fn schema() -> Value {
     json!([
@@ -59,6 +59,27 @@ pub fn schema() -> Value {
                     }
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "manage_schedule",
+                "description": "Create, list or delete reminders. The current local time is at the end of \
+                     the system prompt; all times here are local. For create pass exactly one of at, \
+                     daily_at, weekly_at. The text is what you will receive when the reminder is due.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["create", "list", "delete"]},
+                        "text": {"type": "string", "description": "what to do/say when due, phrased at yourself"},
+                        "at": {"type": "string", "description": "one-shot, local: YYYY-MM-DD HH:MM"},
+                        "daily_at": {"type": "string", "description": "every day at HH:MM local"},
+                        "weekly_at": {"type": "string", "description": "every week at \"mon HH:MM\" local"},
+                        "id": {"type": "integer", "description": "schedule id for delete"}
+                    },
+                    "required": ["action"]
+                }
+            }
         }
     ])
 }
@@ -83,6 +104,7 @@ mod tests {
         assert!(check("bash", false).is_ok());
         assert!(check("read", false).is_ok());
         assert!(check("recall", false).is_ok());
+        assert!(check("manage_schedule", false).is_ok());
         assert!(check("write", false).is_err());
         assert!(check("bash", true).is_err());
     }

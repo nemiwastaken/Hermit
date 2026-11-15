@@ -5,6 +5,7 @@ mod policy;
 mod prompt;
 mod run;
 mod sandbox;
+mod sched;
 mod telegram;
 
 use std::sync::Arc;
@@ -68,6 +69,7 @@ async fn main() -> Result<()> {
 
 async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) {
     let mut next_purge = Instant::now();
+    let mut next_tick = Instant::now();
     loop {
         // Before the paused check on purpose: retention must work while paused.
         if Instant::now() >= next_purge {
@@ -77,6 +79,15 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
                 Err(e) => eprintln!("purge_archive: {e:#}"),
             }
             next_purge = Instant::now() + Duration::from_secs(3600);
+        }
+        // Due reminders become ordinary queue events, so they also wait while paused.
+        if Instant::now() >= next_tick {
+            match sched::enqueue_due(&db) {
+                Ok(0) => {}
+                Ok(n) => eprintln!("queued {n} scheduled event(s)"),
+                Err(e) => eprintln!("schedules: {e:#}"),
+            }
+            next_tick = Instant::now() + Duration::from_secs(60);
         }
         if flags.paused() {
             tokio::time::sleep(Duration::from_millis(500)).await;

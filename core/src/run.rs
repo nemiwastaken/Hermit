@@ -10,6 +10,7 @@ use crate::llm::Llm;
 use crate::policy;
 use crate::prompt;
 use crate::sandbox::Sandbox;
+use crate::sched;
 
 /// Hard stop for a runaway tool loop. The model gets one warning per run,
 /// the queue gets its answer, and the chat stays responsive.
@@ -98,6 +99,10 @@ impl Agent {
         }
 
         let mut system = prompt::system(&self.behavior_dir);
+        system.push_str(&format!(
+            "\nCurrent local time: {}.\n",
+            Local::now().format("%Y-%m-%d %H:%M (%a)")
+        ));
         if let Some(recap) = self.db.kv_get(&recap_key(chat_id))? {
             system.push_str("\n---\n");
             system.push_str(&recap);
@@ -209,6 +214,9 @@ impl Agent {
         }
         if name == "recall" {
             return recall(&self.db, chat_id, args);
+        }
+        if name == "manage_schedule" {
+            return sched::handle(&self.db, chat_id, args);
         }
         match self.tools.call(id, name, args).await {
             Ok(v) => v,
