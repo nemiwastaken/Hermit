@@ -1,5 +1,5 @@
 /// System prompt = fixed core base + the behavior layer, read from disk.
-/// `behavior/` is the user's own git repo; only update_behavior (slice 3) may change it.
+/// `behavior/` is the user's own git repo; only update_behavior (slice 4) may change it.
 pub fn system(behavior_dir: &str) -> String {
     let mut p = String::from(
         "You are Hermit, an agent running on a private home server. You act through tools, \

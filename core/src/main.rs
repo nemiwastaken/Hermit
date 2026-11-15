@@ -4,20 +4,20 @@ mod llm;
 mod policy;
 mod prompt;
 mod run;
-mod telegram;
 mod sandbox;
+mod telegram;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::Value;
 
-use cmd::Flags;
-use events::Db;
+use cmd::{Cmd, Flags};
+use events::{ARCHIVE_DAYS, Db};
 use run::Agent;
-use telegram::Tg;
 use sandbox::Sandbox;
+use telegram::Tg;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -67,7 +67,17 @@ async fn main() -> Result<()> {
 }
 
 async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) {
+    let mut next_purge = Instant::now();
     loop {
+        // Before the paused check on purpose: retention must work while paused.
+        if Instant::now() >= next_purge {
+            match db.purge_archive(ARCHIVE_DAYS) {
+                Ok(0) => {}
+                Ok(n) => eprintln!("purged {n} archived session(s) older than {ARCHIVE_DAYS} days"),
+                Err(e) => eprintln!("purge_archive: {e:#}"),
+            }
+            next_purge = Instant::now() + Duration::from_secs(3600);
+        }
         if flags.paused() {
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
@@ -89,10 +99,11 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
         let chat_id = payload["chat_id"].as_i64().unwrap_or(0);
         let text = payload["text"].as_str().unwrap_or("").to_string();
 
-        let outcome = if let Some(answer) = cmd::handle(&text, &flags, &db, chat_id) {
-            Ok(answer)
-        } else {
-            agent.reply(ev.id, chat_id, &text).await
+        let outcome = match cmd::handle(&text, &flags, &db, chat_id) {
+            Some(Cmd::Answer(answer)) => Ok(answer),
+            Some(Cmd::NewSession) => agent.new_session(chat_id).await,
+            Some(Cmd::ResumeSession(id)) => agent.resume_session(chat_id, id).await,
+            None => agent.reply(ev.id, chat_id, &text).await,
         };
 
         match outcome {

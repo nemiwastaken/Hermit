@@ -4,6 +4,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+use serde_json::Value;
+
+/// Sessions are forgotten this many days after their last message.
+pub const ARCHIVE_DAYS: i64 = 30;
 
 // shortcut: no automatic retry yet. Re-running a run that already executed
 // tools can duplicate side effects, so a failed event parks in the DLQ instead.
@@ -16,6 +20,21 @@ pub struct Event {
     pub kind: String,
     pub payload: String,
     pub attempts: i64,
+}
+
+/// A closed session without its transcript: enough for listing and search.
+#[derive(Debug, Clone)]
+pub struct Archived {
+    pub id: i64,
+    pub title: String,
+    pub task: String,
+    pub final_answer: String,
+    pub updated_at: String,
+}
+
+pub struct ArchivedFull {
+    pub info: Archived,
+    pub history: Vec<Value>,
 }
 
 /// One SQLite connection behind a mutex. The worker is serial, so a pool is
@@ -35,6 +54,7 @@ impl Db {
         let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(include_str!("../migrations/0001_init.sql"))?;
+        conn.execute_batch(include_str!("../migrations/0002_archive.sql"))?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
@@ -97,21 +117,23 @@ impl Db {
         Ok(())
     }
 
-    pub fn history(&self, chat_id: i64) -> Result<Vec<serde_json::Value>> {
-        let raw: Option<String> = self
+    /// Messages and the time of the last one (RFC3339, UTC).
+    pub fn history(&self, chat_id: i64) -> Result<(Vec<Value>, Option<String>)> {
+        let row: Option<(String, String)> = self
             .lock()
             .query_row(
-                "SELECT history FROM sessions WHERE chat_id = ?1",
+                "SELECT history, updated_at FROM sessions WHERE chat_id = ?1",
                 params![chat_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        Ok(raw
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default())
+        Ok(match row {
+            Some((h, at)) => (serde_json::from_str(&h).unwrap_or_default(), Some(at)),
+            None => (Vec::new(), None),
+        })
     }
 
-    pub fn save_history(&self, chat_id: i64, history: &[serde_json::Value]) -> Result<()> {
+    pub fn save_history(&self, chat_id: i64, history: &[Value]) -> Result<()> {
         self.lock().execute(
             "INSERT INTO sessions (chat_id, history, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(chat_id) DO UPDATE SET history = ?2, updated_at = ?3",
@@ -124,6 +146,150 @@ impl Db {
         self.lock()
             .execute("DELETE FROM sessions WHERE chat_id = ?1", params![chat_id])?;
         Ok(())
+    }
+
+    /// `last_activity` is the last message of the session being closed, not the
+    /// moment it is closed: retention counts from the message.
+    pub fn archive(
+        &self,
+        chat_id: i64,
+        title: &str,
+        task: &str,
+        final_answer: &str,
+        history: &[Value],
+        last_activity: &str,
+    ) -> Result<i64> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO archive
+                 (chat_id, title, task, final_answer, history, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                chat_id,
+                title,
+                task,
+                final_answer,
+                serde_json::to_string(history)?,
+                now(),
+                last_activity
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn archived(&self, chat_id: i64, id: i64) -> Result<Option<ArchivedFull>> {
+        let row = self
+            .lock()
+            .query_row(
+                "SELECT id, title, task, final_answer, updated_at, history
+                 FROM archive WHERE chat_id = ?1 AND id = ?2",
+                params![chat_id, id],
+                |r| {
+                    Ok((
+                        Archived {
+                            id: r.get(0)?,
+                            title: r.get(1)?,
+                            task: r.get(2)?,
+                            final_answer: r.get(3)?,
+                            updated_at: r.get(4)?,
+                        },
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.map(|(info, history)| ArchivedFull {
+            info,
+            history: serde_json::from_str(&history).unwrap_or_default(),
+        }))
+    }
+
+    /// Everything without transcripts, newest first. LIMIT -1 means all rows.
+    pub fn catalog(&self, chat_id: i64) -> Result<Vec<Archived>> {
+        self.list_archived(chat_id, -1)
+    }
+
+    pub fn recent_archived(&self, chat_id: i64, limit: usize) -> Result<Vec<Archived>> {
+        self.list_archived(chat_id, limit as i64)
+    }
+
+    fn list_archived(&self, chat_id: i64, limit: i64) -> Result<Vec<Archived>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, task, final_answer, updated_at FROM archive
+             WHERE chat_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![chat_id, limit], |r| {
+            Ok(Archived {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                task: r.get(2)?,
+                final_answer: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn rename_archived(&self, chat_id: i64, id: i64, title: &str) -> Result<bool> {
+        let n = self.lock().execute(
+            "UPDATE archive SET title = ?3 WHERE chat_id = ?1 AND id = ?2",
+            params![chat_id, id, title],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn delete_archived(&self, chat_id: i64, id: i64) -> Result<bool> {
+        let n = self.lock().execute(
+            "DELETE FROM archive WHERE chat_id = ?1 AND id = ?2",
+            params![chat_id, id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Move an archived session back into the active slot. One transaction, so
+    /// a crash cannot leave both or neither.
+    pub fn resume_archived(&self, chat_id: i64, id: i64) -> Result<bool> {
+        let conn = self.lock();
+        let tx = conn.unchecked_transaction()?;
+        let history: Option<String> = tx
+            .query_row(
+                "SELECT history FROM archive WHERE chat_id = ?1 AND id = ?2",
+                params![chat_id, id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(history) = history else {
+            return Ok(false);
+        };
+        tx.execute(
+            "INSERT INTO sessions (chat_id, history, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(chat_id) DO UPDATE SET history = ?2, updated_at = ?3",
+            params![chat_id, history, now()],
+        )?;
+        tx.execute(
+            "DELETE FROM archive WHERE chat_id = ?1 AND id = ?2",
+            params![chat_id, id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn archive_count(&self, chat_id: i64) -> Result<i64> {
+        Ok(self.lock().query_row(
+            "SELECT count(*) FROM archive WHERE chat_id = ?1",
+            params![chat_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Retention. Rows store our own UTC `+00:00` timestamps, so a string
+    /// comparison against an RFC3339 cutoff is exact.
+    pub fn purge_archive(&self, days: i64) -> Result<usize> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        Ok(self
+            .lock()
+            .execute("DELETE FROM archive WHERE updated_at < ?1", params![cutoff])?)
     }
 
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
@@ -141,6 +307,12 @@ impl Db {
              ON CONFLICT(key) DO UPDATE SET value = ?2",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    pub fn kv_del(&self, key: &str) -> Result<()> {
+        self.lock()
+            .execute("DELETE FROM kv WHERE key = ?1", params![key])?;
         Ok(())
     }
 
@@ -163,4 +335,104 @@ impl Db {
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// `kv` keys for the active session.
+pub fn task_key(chat_id: i64) -> String {
+    format!("task:{chat_id}")
+}
+
+pub fn recap_key(chat_id: i64) -> String {
+    format!("recap:{chat_id}")
+}
+
+pub fn recap_id_key(chat_id: i64) -> String {
+    format!("recap_id:{chat_id}")
+}
+
+/// True only when the timestamp parses and is older than `days`. An
+/// unreadable timestamp is treated as "unknown", never as expired.
+pub fn expired(updated_at: &str, now: chrono::DateTime<chrono::Utc>, days: i64) -> bool {
+    match chrono::DateTime::parse_from_rfc3339(updated_at) {
+        Ok(t) => t.with_timezone(&chrono::Utc) < now - chrono::Duration::days(days),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const OLD: &str = "2020-01-01T00:00:00+00:00";
+
+    fn open(name: &str) -> (Arc<Db>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hermit-db-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(dir.join("t.db").to_str().unwrap()).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn archive_roundtrip_resume_and_isolation() {
+        let (db, dir) = open("archive");
+        let h = vec![json!({"role":"user","content":"fix docker"})];
+        let id = db
+            .archive(1, "Fixed docker", "fix docker", "done", &h, OLD)
+            .unwrap();
+        assert_eq!(db.archive_count(1).unwrap(), 1);
+        assert!(db.catalog(2).unwrap().is_empty(), "chats are isolated");
+
+        let full = db.archived(1, id).unwrap().unwrap();
+        assert_eq!(full.info.title, "Fixed docker");
+        assert_eq!(full.history, h);
+
+        assert!(db.rename_archived(1, id, "Docker fixed").unwrap());
+        assert_eq!(db.catalog(1).unwrap()[0].title, "Docker fixed");
+        assert!(!db.rename_archived(2, id, "nope").unwrap());
+
+        db.save_history(1, &h).unwrap();
+        assert!(db.resume_archived(1, id).unwrap());
+        assert_eq!(db.history(1).unwrap().0, h);
+        assert_eq!(db.archive_count(1).unwrap(), 0);
+        assert!(!db.resume_archived(1, id).unwrap());
+
+        let id = db.archive(1, "two", "t", "f", &h, OLD).unwrap();
+        assert!(db.delete_archived(1, id).unwrap());
+        assert!(!db.delete_archived(1, id).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purge_removes_only_old_and_history_reports_time() {
+        let (db, dir) = open("purge");
+        let h = vec![json!({"role":"user","content":"x"})];
+        db.archive(1, "old", "t", "f", &h, OLD).unwrap();
+        db.archive(1, "new", "t", "f", &h, &now()).unwrap();
+        assert_eq!(db.purge_archive(ARCHIVE_DAYS).unwrap(), 1);
+        let left = db.catalog(1).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].title, "new");
+
+        assert_eq!(db.history(1).unwrap().1, None);
+        db.save_history(1, &h).unwrap();
+        assert!(db.history(1).unwrap().1.is_some());
+        assert_eq!(db.history(1).unwrap().0, h);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kv_delete_and_expired() {
+        let (db, dir) = open("kv");
+        db.kv_set("task:1", "fix").unwrap();
+        assert_eq!(db.kv_get("task:1").unwrap().as_deref(), Some("fix"));
+        db.kv_del("task:1").unwrap();
+        assert_eq!(db.kv_get("task:1").unwrap(), None);
+
+        let now = chrono::Utc::now();
+        assert!(expired(OLD, now, ARCHIVE_DAYS));
+        assert!(!expired(&now.to_rfc3339(), now, ARCHIVE_DAYS));
+        assert!(!expired("не дата", now, ARCHIVE_DAYS));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

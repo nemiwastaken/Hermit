@@ -1,8 +1,8 @@
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-/// The only tools core is allowed to ask for in slice 1.
-const ALLOWED: [&str; 2] = ["bash", "read"];
+/// The only tools core is allowed to ask for.
+const ALLOWED: [&str; 3] = ["bash", "read", "recall"];
 
 pub fn schema() -> Value {
     json!([
@@ -43,6 +43,22 @@ pub fn schema() -> Value {
                     "required": ["path"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "recall",
+                "description": "Read an earlier conversation from the archive. With session_id return its \
+                     transcript; without arguments return the session mentioned in the recap, or the last \
+                     10 sessions; with query search past sessions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "integer", "description": "archived session id"},
+                        "query": {"type": "string", "description": "words to search in past sessions"}
+                    }
+                }
+            }
         }
     ])
 }
@@ -66,6 +82,7 @@ mod tests {
     fn denies_unknown_and_safe_mode() {
         assert!(check("bash", false).is_ok());
         assert!(check("read", false).is_ok());
+        assert!(check("recall", false).is_ok());
         assert!(check("write", false).is_err());
         assert!(check("bash", true).is_err());
     }
