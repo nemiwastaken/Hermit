@@ -2,6 +2,9 @@
 Description=Hermit core (LLM control plane)
 After=network-online.target docker.service
 Wants=network-online.target
+# A bad config (empty token) must not restart forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
