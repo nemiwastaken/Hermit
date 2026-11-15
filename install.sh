@@ -178,7 +178,7 @@ if [ ! -f "$CONF" ]; then
         ask_hidden() { IFS= read -rs -p "   $1" "$2" <&3 || true; printf '\n'; }
         ask_hidden "Telegram bot token (@BotFather): " tg_token
         ask_hidden "LLM API key (DeepSeek): " llm_key
-        ask "Allowed chat ids, comma separated [optional, blank = ask the bot]: " chats
+        ask "Allowed user ids, comma separated [optional, blank = ask the bot]: " users
         exec 3<&-
         esc() { printf '%s' "$1" | sed 's/[&/\]/\\&/g'; }
         if [ -n "${tg_token:-}" ]; then
@@ -187,8 +187,8 @@ if [ ! -f "$CONF" ]; then
         if [ -n "${llm_key:-}" ]; then
             sed -i "s|^LLM_API_KEY=.*|LLM_API_KEY=$(esc "$llm_key")|" "$CONF"
         fi
-        if [ -n "${chats:-}" ]; then
-            sed -i "s|^TELEGRAM_ALLOWED_CHAT_IDS=.*|TELEGRAM_ALLOWED_CHAT_IDS=$(esc "$chats")|" "$CONF"
+        if [ -n "${users:-}" ]; then
+            sed -i "s|^TELEGRAM_ALLOWED_USER_IDS=.*|TELEGRAM_ALLOWED_USER_IDS=$(esc "$users")|" "$CONF"
         fi
         if [ -z "${tg_token:-}" ] || [ -z "${llm_key:-}" ]; then
             echo "   warning: without a token and an API key the service will not stay up"
@@ -200,6 +200,9 @@ else
     say "keeping existing $CONF"
     # The paths belong to the install, not to the config: keep them pointing here.
     sed -i "${PATHS[@]}" "$CONF"
+    # Configs written before the user allow-list existed get the key.
+    grep -q '^TELEGRAM_ALLOWED_USER_IDS=' "$CONF" ||
+        echo 'TELEGRAM_ALLOWED_USER_IDS=' >> "$CONF"
 fi
 
 # ---------------------------------------------------------------- sandbox

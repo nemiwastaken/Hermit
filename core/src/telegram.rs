@@ -11,7 +11,16 @@ const TG_TEXT_LIMIT: usize = 4000;
 pub struct Tg {
     http: reqwest::Client,
     base: String,
-    allowed: Vec<i64>,
+    allowed_chats: Vec<i64>,
+    allowed_users: Vec<i64>,
+}
+
+fn id_list(name: &str) -> Vec<i64> {
+    std::env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .collect()
 }
 
 impl Tg {
@@ -21,11 +30,10 @@ impl Tg {
         if token.trim().is_empty() {
             bail!("TELEGRAM_BOT_TOKEN is empty");
         }
-        let allowed = std::env::var("TELEGRAM_ALLOWED_CHAT_IDS")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|s| s.trim().parse::<i64>().ok())
-            .collect();
+        // TELEGRAM_ALLOWED_CHAT_IDS is the old name; in a private chat it is the
+        // same number as the user id, so old configs keep working.
+        let allowed_chats = id_list("TELEGRAM_ALLOWED_CHAT_IDS");
+        let allowed_users = id_list("TELEGRAM_ALLOWED_USER_IDS");
         // Long polling holds the request for 30s, so the client timeout must be longer.
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(90))
@@ -35,9 +43,18 @@ impl Tg {
         Ok(Self {
             http,
             base: format!("{}/bot{token}", api.trim_end_matches('/')),
-            allowed,
+            allowed_chats,
+            allowed_users,
         })
     }
+
+    /// Private chats only: in a group or channel the agent would be talking to
+    /// strangers. Ownership is then checked per user.
+    fn permitted(&self, kind: &str, chat_id: i64, user_id: i64) -> bool {
+        kind == "private"
+            && (self.allowed_chats.contains(&chat_id) || self.allowed_users.contains(&user_id))
+    }
+
 
     pub async fn poll_forever(&self, db: Arc<Db>) {
         let mut offset: i64 = db
@@ -85,21 +102,30 @@ impl Tg {
         Ok(v["result"].as_array().cloned().unwrap_or_default())
     }
 
-    /// The bot token is worth nothing without a chat allow-list; anything else
-    /// that talks to it must be rejected here, before an event is created.
+    /// The bot token is worth nothing without an allow-list; anything else that
+    /// talks to it must be rejected here, before an event is created.
     async fn on_update(&self, u: &Value, db: &Db) -> Result<()> {
         let msg = &u["message"];
-        let Some(chat_id) = msg["chat"]["id"].as_i64() else {
+        let chat = &msg["chat"];
+        let Some(chat_id) = chat["id"].as_i64() else {
             return Ok(());
         };
         let Some(text) = msg["text"].as_str() else {
             return Ok(()); // photos, stickers: nothing to run
         };
-        if !self.allowed.contains(&chat_id) {
-            eprintln!("rejected chat {chat_id}: add it to TELEGRAM_ALLOWED_CHAT_IDS");
+        let kind = chat["type"].as_str().unwrap_or("");
+        let user_id = msg["from"]["id"].as_i64().unwrap_or(chat_id);
+        if kind != "private" {
+            eprintln!("ignoring {kind} chat {chat_id}: private chats only");
+            return Ok(());
+        }
+        if !self.permitted(kind, chat_id, user_id) {
+            eprintln!("rejected user {user_id}: add it to TELEGRAM_ALLOWED_USER_IDS");
             self.send(
                 chat_id,
-                &format!("Доступ закрыт. Чтобы разрешить этот чат, добавь в .env:\nTELEGRAM_ALLOWED_CHAT_IDS={chat_id}"),
+                &format!(
+                    "Доступ закрыт. Чтобы разрешить, добавь в /opt/hermit/hermit.env:\nTELEGRAM_ALLOWED_USER_IDS={user_id}"
+                ),
             )
             .await?;
             return Ok(());
@@ -162,6 +188,30 @@ pub fn chunks(text: &str, max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tg(chats: &[i64], users: &[i64]) -> Tg {
+        Tg {
+            http: reqwest::Client::new(),
+            base: String::new(),
+            allowed_chats: chats.to_vec(),
+            allowed_users: users.to_vec(),
+        }
+    }
+
+    #[test]
+    fn only_allowed_users_in_private_chats() {
+        let t = tg(&[], &[42]);
+        assert!(t.permitted("private", 42, 42));
+        assert!(!t.permitted("private", 7, 7));
+        // A group is answered even if every member is allowed.
+        assert!(!t.permitted("group", 42, 42));
+        assert!(!t.permitted("channel", 42, 42));
+
+        // Old chat-id config still works, and an empty one allows nobody.
+        let old = tg(&[99], &[]);
+        assert!(old.permitted("private", 99, 99));
+        assert!(!tg(&[], &[]).permitted("private", 99, 99));
+    }
 
     #[test]
     fn splits_long_text_without_losing_content() {
