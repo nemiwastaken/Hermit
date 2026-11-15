@@ -59,6 +59,11 @@ fn parse(value: &Value) -> Vec<McpTool> {
                 .chars()
                 .take(1_000)
                 .collect();
+            let description = if description.trim().is_empty() {
+                format!("MCP tool {server_name}/{tool_name}")
+            } else {
+                description
+            };
             let parameters = tool["inputSchema"]
                 .as_object()
                 .map(|_| tool["inputSchema"].clone())
