@@ -121,4 +121,4 @@ home network (private addresses are blocked by default, as in `web_fetch`).
 
 ## License
 
-See `LICENSE`.
+[MIT](LICENSE)
