@@ -2,12 +2,14 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 /// The only tools core is allowed to ask for.
-const ALLOWED: [&str; 5] = [
+const ALLOWED: [&str; 7] = [
     "bash",
     "read",
     "recall",
     "manage_schedule",
     "update_behavior",
+    "log_metric",
+    "query_metrics",
 ];
 
 pub fn schema() -> Value {
@@ -104,6 +106,42 @@ pub fn schema() -> Value {
                     "required": ["path", "content"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "log_metric",
+                "description": "Record a number or a short fact under a key, with an optional JSON object \
+                     of extra fields. Use it when the user gives a measurable value or asks you to \
+                     remember a dated fact.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "short stable name, e.g. weight or mood"},
+                        "value_num": {"type": "number"},
+                        "value_text": {"type": "string"},
+                        "meta": {"type": "object", "description": "extra fields, e.g. {\"unit\": \"kg\"}"}
+                    },
+                    "required": ["key"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_metrics",
+                "description": "Read recorded metrics. With key: count/sum/avg/min/max/last plus recent \
+                     rows; since_days limits the window. Without key: list known keys. Numbers come \
+                     from SQLite, never estimate them yourself.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "since_days": {"type": "integer", "description": "window in days"},
+                        "limit": {"type": "integer", "description": "max recent rows, default 10"}
+                    }
+                }
+            }
         }
     ])
 }
@@ -130,6 +168,8 @@ mod tests {
         assert!(check("recall", false).is_ok());
         assert!(check("manage_schedule", false).is_ok());
         assert!(check("update_behavior", false).is_ok());
+        assert!(check("log_metric", false).is_ok());
+        assert!(check("query_metrics", false).is_ok());
         assert!(check("write", false).is_err());
         assert!(check("bash", true).is_err());
     }

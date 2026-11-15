@@ -8,6 +8,7 @@ use crate::behavior;
 use crate::cmd::Flags;
 use crate::events::{self, ARCHIVE_DAYS, Archived, Db, recap_id_key, recap_key, task_key};
 use crate::llm::Llm;
+use crate::metrics;
 use crate::policy;
 use crate::prompt;
 use crate::sandbox::Sandbox;
@@ -227,6 +228,12 @@ impl Agent {
                 Ok(msg) => json!({"ok": true, "result": msg}),
                 Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
             };
+        }
+        if name == "log_metric" {
+            return metrics::log(&self.db, chat_id, args);
+        }
+        if name == "query_metrics" {
+            return metrics::query(&self.db, chat_id, args);
         }
         match self.tools.call(id, name, args).await {
             Ok(v) => v,

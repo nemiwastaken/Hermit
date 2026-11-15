@@ -46,6 +46,26 @@ pub struct Schedule {
     pub repeat: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct Metric {
+    pub value_num: Option<f64>,
+    pub value_text: Option<String>,
+    pub meta: String,
+    pub ts: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetricStats {
+    pub count: i64,
+    pub sum: f64,
+    pub avg: f64,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub last_num: Option<f64>,
+    pub last_text: Option<String>,
+    pub last_ts: Option<String>,
+}
+
 /// One SQLite connection behind a mutex. The worker is serial, so a pool is
 /// pointless here; WAL still lets the telegram poller write while it runs.
 pub struct Db {
@@ -65,6 +85,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/0001_init.sql"))?;
         conn.execute_batch(include_str!("../migrations/0002_archive.sql"))?;
         conn.execute_batch(include_str!("../migrations/0003_schedules.sql"))?;
+        conn.execute_batch(include_str!("../migrations/0004_metrics.sql"))?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
@@ -353,6 +374,112 @@ impl Db {
             params![chat_id, id],
         )?;
         Ok(n > 0)
+    }
+
+    pub fn metric_add(
+        &self,
+        chat_id: i64,
+        key: &str,
+        value_num: Option<f64>,
+        value_text: Option<&str>,
+        meta: &str,
+        ts: &str,
+    ) -> Result<i64> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO metrics (chat_id, metric_key, value_num, value_text, meta_json, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![chat_id, key, value_num, value_text, meta, ts],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn metric_rows(
+        &self,
+        chat_id: i64,
+        key: &str,
+        since: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Metric>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT value_num, value_text, meta_json, ts FROM metrics
+             WHERE chat_id = ?1 AND metric_key = ?2 AND (?3 IS NULL OR ts >= ?3)
+             ORDER BY ts DESC, id DESC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![chat_id, key, since, limit as i64], |r| {
+            Ok(Metric {
+                value_num: r.get(0)?,
+                value_text: r.get(1)?,
+                meta: r.get(2)?,
+                ts: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn metric_stats(
+        &self,
+        chat_id: i64,
+        key: &str,
+        since: Option<&str>,
+    ) -> Result<MetricStats> {
+        let conn = self.lock();
+        let (count, sum, avg, min, max, last_ts) = conn.query_row(
+            "SELECT count(*), coalesce(sum(value_num), 0), coalesce(avg(value_num), 0),
+                    min(value_num), max(value_num), max(ts)
+             FROM metrics
+             WHERE chat_id = ?1 AND metric_key = ?2 AND (?3 IS NULL OR ts >= ?3)",
+            params![chat_id, key, since],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )?;
+        let last: Option<(Option<f64>, Option<String>)> = conn
+            .query_row(
+                "SELECT value_num, value_text FROM metrics
+                 WHERE chat_id = ?1 AND metric_key = ?2 AND (?3 IS NULL OR ts >= ?3)
+                 ORDER BY ts DESC, id DESC LIMIT 1",
+                params![chat_id, key, since],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (last_num, last_text) = last.unwrap_or((None, None));
+        Ok(MetricStats {
+            count,
+            sum,
+            avg,
+            min,
+            max,
+            last_num,
+            last_text,
+            last_ts,
+        })
+    }
+
+    /// Keys seen in the window, most recently used first.
+    pub fn metric_keys(
+        &self,
+        chat_id: i64,
+        since: Option<&str>,
+    ) -> Result<Vec<(String, i64, Option<String>)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT metric_key, count(*), max(ts) FROM metrics
+             WHERE chat_id = ?1 AND (?2 IS NULL OR ts >= ?2)
+             GROUP BY metric_key ORDER BY max(ts) DESC",
+        )?;
+        let rows = stmt.query_map(params![chat_id, since], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
