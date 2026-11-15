@@ -2,6 +2,7 @@ mod behavior;
 mod cmd;
 mod events;
 mod llm;
+mod md;
 mod metrics;
 mod policy;
 mod prompt;

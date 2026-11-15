@@ -174,10 +174,7 @@ impl Tg {
 
     pub async fn send(&self, chat_id: i64, text: &str) -> Result<()> {
         for chunk in chunks(text, TG_TEXT_LIMIT) {
-            self.send_message(
-                json!({"chat_id": chat_id, "text": chunk, "disable_web_page_preview": true}),
-            )
-            .await?;
+            self.send_formatted(chat_id, &chunk, None).await?;
         }
         Ok(())
     }
@@ -187,17 +184,45 @@ impl Tg {
         let parts = chunks(text, TG_TEXT_LIMIT);
         let last = parts.len() - 1;
         for (i, chunk) in parts.iter().enumerate() {
-            let mut body =
-                json!({"chat_id": chat_id, "text": chunk, "disable_web_page_preview": true});
-            if i == last {
-                body["reply_markup"] = json!({"inline_keyboard": [[
+            let markup = (i == last).then(|| {
+                json!({"inline_keyboard": [[
                     {"text": "✅ Выполнить", "callback_data": format!("approve:{id}")},
                     {"text": "⛔ Отклонить", "callback_data": format!("deny:{id}")},
-                ]]});
-            }
-            self.send_message(body).await?;
+                ]]})
+            });
+            self.send_formatted(chat_id, chunk, markup).await?;
         }
         Ok(())
+    }
+
+    /// Markdown becomes Telegram HTML. If Telegram still refuses the markup,
+    /// the same chunk goes as plain text: an odd marker must not lose an answer.
+    async fn send_formatted(&self, chat_id: i64, chunk: &str, markup: Option<Value>) -> Result<()> {
+        let html = crate::md::to_html(chunk);
+        let mut plain =
+            json!({"chat_id": chat_id, "text": chunk, "disable_web_page_preview": true});
+        // Markup can push a chunk over Telegram's 4096-unit cap, in which case
+        // plain text is the only form that fits.
+        if html.encode_utf16().count() <= TG_TEXT_LIMIT {
+            let mut rich = json!({"chat_id": chat_id, "text": html, "parse_mode": "HTML",
+                                  "disable_web_page_preview": true});
+            if let Some(m) = &markup {
+                rich["reply_markup"] = m.clone();
+            }
+            match self.send_message(rich).await {
+                Ok(()) => return Ok(()),
+                // Only a 400 means the markup was refused; a timeout may have
+                // delivered the message already, so it must not be resent.
+                Err(e) if format!("{e:#}").contains("HTTP 400") => {
+                    eprintln!("telegram html send: {e:#}");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some(m) = markup {
+            plain["reply_markup"] = m;
+        }
+        self.send_message(plain).await
     }
 
     async fn send_message(&self, body: Value) -> Result<()> {
