@@ -75,7 +75,15 @@ pub fn system(behavior_dir: &str) -> String {
         }
     }
 
-    if let Some(days) = memory_age_days(behavior_dir)
+    if !std::path::Path::new(behavior_dir)
+        .join("MEMORY.md")
+        .exists()
+    {
+        p.push_str(
+            "\nMEMORY.md does not exist yet. When the user shares a durable fact, create it \
+             with memory(add=\"...\").\n",
+        );
+    } else if let Some(days) = memory_age_days(behavior_dir)
         && days >= 7
     {
         p.push_str(&format!(
