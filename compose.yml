@@ -3,7 +3,8 @@ services:
     build: ./sandbox
     container_name: hermit-sandbox
     restart: unless-stopped
-    # No network at all in slice 1. Add it only when a tool needs it, never for the model.
+    # No network here, ever: bash must not reach out. The net service below is the
+    # only container with a route to the internet, and it has no workspace.
     network_mode: none
     user: "${HERMIT_UID:-1000}:${HERMIT_GID:-1000}"
     environment:
@@ -17,3 +18,19 @@ services:
       - /tmp:size=64m
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+
+  net:
+    build: ./net
+    container_name: hermit-net
+    restart: unless-stopped
+    # The only way out to the internet. No workspace, no behavior, no database:
+    # a page can only see what the model sends it.
+    user: "${HERMIT_UID:-1000}:${HERMIT_GID:-1000}"
+    volumes:
+      - ${HERMIT_RUN_DIR:-./.dev/run}:/run/hermit
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m

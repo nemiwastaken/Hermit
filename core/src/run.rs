@@ -39,6 +39,8 @@ pub(crate) const APPROVAL_MINUTES: i64 = 60;
 pub struct Agent {
     pub llm: Llm,
     pub tools: Sandbox,
+    /// The net container: web_fetch and web_search, the only route out.
+    pub net: Sandbox,
     pub db: Arc<Db>,
     pub flags: Arc<Flags>,
     pub behavior_dir: String,
@@ -339,7 +341,13 @@ impl Agent {
         if name == "query_metrics" {
             return metrics::query(&self.db, chat_id, args);
         }
-        match self.tools.call(id, name, args).await {
+        // The internet lives in its own container, not in the sandbox.
+        let sandbox = if name == "web_fetch" || name == "web_search" {
+            &self.net
+        } else {
+            &self.tools
+        };
+        match sandbox.call(id, name, args).await {
             Ok(v) => v,
             Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
         }

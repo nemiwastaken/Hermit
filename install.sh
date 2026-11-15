@@ -11,6 +11,7 @@
 # Everything lives under one prefix, PREFIX=/opt/hermit by default:
 #   bin/hermit        binary
 #   sandbox/          Dockerfile + server.py for the sandbox image
+#   net/              Dockerfile + server.py for the one container with internet
 #   behavior/         your git repo: profile + skills
 #   hermit.env        secrets and paths (mode 600)
 #   data/hermit.db    SQLite database
@@ -149,12 +150,13 @@ fi
 
 # ---------------------------------------------------------------- layout
 say "creating directories"
-install -d -m 755 "$PREFIX" "$PREFIX/bin" "$PREFIX/sandbox"
+install -d -m 755 "$PREFIX" "$PREFIX/bin" "$PREFIX/sandbox" "$PREFIX/net"
 install -d -m 700 -o root -g root "$DATA"
 install -d -m 700 -o "$RUN_USER" -g "$RUN_GID" "$RUN_DIR"
 install -d -m 755 -o "$RUN_USER" -g "$RUN_GID" "$WORKSPACE"
 
 install -m 644 "$REPO/sandbox/server.py" "$REPO/sandbox/Dockerfile" "$PREFIX/sandbox/"
+install -m 644 "$REPO/net/server.py" "$REPO/net/Dockerfile" "$PREFIX/net/"
 install -m 644 "$REPO/compose.yml" "$PREFIX/compose.yml"
 
 cat > "$PREFIX/.env" <<EOF
@@ -203,6 +205,7 @@ fi
 PATHS=(
     -e "s|^DATABASE_PATH=.*|DATABASE_PATH=$DATA/hermit.db|"
     -e "s|^SANDBOX_SOCKET=.*|SANDBOX_SOCKET=$RUN_DIR/sandbox.sock|"
+    -e "s|^NET_SOCKET=.*|NET_SOCKET=$RUN_DIR/net.sock|"
     -e "s|^BEHAVIOR_DIR=.*|BEHAVIOR_DIR=$PREFIX/behavior|"
 )
 if [ ! -f "$CONF" ]; then
@@ -243,11 +246,14 @@ else
     # Configs written before the user allow-list existed get the key.
     grep -q '^TELEGRAM_ALLOWED_USER_IDS=' "$CONF" ||
         echo 'TELEGRAM_ALLOWED_USER_IDS=' >> "$CONF"
+    # Configs written before the internet tools existed get the socket path.
+    grep -q '^NET_SOCKET=' "$CONF" ||
+        echo "NET_SOCKET=$RUN_DIR/net.sock" >> "$CONF"
 fi
 
 # ---------------------------------------------------------------- sandbox
 if [ "$NO_START" -eq 0 ]; then
-    say "starting the sandbox container"
+    say "starting the sandbox and net containers"
     need docker "install Docker, or pass --no-start"
     ( cd "$PREFIX" && docker compose up -d --build )
 fi
@@ -294,7 +300,7 @@ cat <<EOF
 Hermit installed:
   version    $VERSION ($GIT_REV)
   binary     $PREFIX/bin/hermit
-  sandbox    $PREFIX/compose.yml -> container hermit-sandbox
+  containers $PREFIX/compose.yml -> hermit-sandbox (offline), hermit-net (internet)
   behavior   $PREFIX/behavior (git repo)
   config     $CONF (mode 600)
   database   $DATA/hermit.db

@@ -14,9 +14,15 @@ pub struct Sandbox {
 impl Sandbox {
     pub fn new(socket: impl Into<String>) -> Self {
         // The container applies its own timeout_ms; this is just the outer guard.
+        Self::with_timeout(socket, 660)
+    }
+
+    /// The net container answers in seconds, so a hung one must not hold the
+    /// worker for eleven minutes.
+    pub fn with_timeout(socket: impl Into<String>, secs: u64) -> Self {
         Self {
             socket: socket.into(),
-            timeout: Duration::from_secs(660),
+            timeout: Duration::from_secs(secs),
         }
     }
 

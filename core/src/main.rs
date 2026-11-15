@@ -32,6 +32,7 @@ async fn main() -> Result<()> {
     let safe_mode = std::env::args().any(|a| a == "--safe-mode");
     let db_path = env_or("DATABASE_PATH", "./data/hermit.db");
     let socket = env_or("SANDBOX_SOCKET", "/opt/hermit/run/sandbox.sock");
+    let net_socket = env_or("NET_SOCKET", "/opt/hermit/run/net.sock");
     let behavior_dir = env_or("BEHAVIOR_DIR", "./behavior");
 
     let db = Db::open(&db_path)?;
@@ -44,13 +45,14 @@ async fn main() -> Result<()> {
     let agent = Arc::new(Agent {
         llm: llm::Llm::from_env()?,
         tools: Sandbox::new(&socket),
+        net: Sandbox::with_timeout(&net_socket, 60),
         db: db.clone(),
         flags: flags.clone(),
         behavior_dir,
     });
 
     eprintln!(
-        "hermit core up: db={db_path} sandbox={socket} safe_mode={}",
+        "hermit core up: db={db_path} sandbox={socket} net={net_socket} safe_mode={}",
         flags.safe()
     );
 
