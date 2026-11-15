@@ -71,7 +71,7 @@ pub fn handle(text: &str, flags: &Flags, db: &Db, chat_id: i64) -> Option<String
             db.queue_len().unwrap_or(-1)
         ),
         "/rollback" | "/changes" => {
-            "Появится на срезе 3: тогда у behavior/ будет git-история и откат.".into()
+            "Появится на срезе 4: тогда у behavior/ будет git-история и откат.".into()
         }
         _ => format!("Неизвестная команда {cmd}.\n\n{HELP}"),
     };
@@ -88,7 +88,7 @@ const HELP: &str = "/pause — остановить обработку\n\
 /safe off — вернуть инструменты\n\
 /status — очередь, режимы\n\
 /clear — забыть контекст чата\n\
-/rollback, /changes — срез 3";
+/rollback, /changes — срез 4";
 
 #[cfg(test)]
 mod tests {
