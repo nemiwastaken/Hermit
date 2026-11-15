@@ -24,8 +24,8 @@ const ALLOWED: [&str; 19] = [
     "web_search",
 ];
 
-pub fn schema() -> Value {
-    json!([
+pub fn schema(extra: &[crate::mcp::McpTool]) -> Value {
+    let mut all = json!([
         {
             "type": "function",
             "function": {
@@ -294,12 +294,13 @@ pub fn schema() -> Value {
             "function": {
                 "name": "update_behavior",
                 "description": "Replace one behavior file and commit it. Use it when the user asks you \
-                     to remember something about them or to change your style or skills. path is \
-                     user_profile.md or skills/<name>.md; content is the full new file.",
+                     to change your style or skills. path is USER.md (user_profile.md in older \
+                     installs) or skills/<name>.md; content is the full new file. For a fact about \
+                     the user use memory instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "user_profile.md or skills/<name>.md"},
+                        "path": {"type": "string", "description": "USER.md, user_profile.md or skills/<name>.md"},
                         "content": {"type": "string", "description": "the full new file"},
                         "note": {"type": "string", "description": "one-line reason for the commit"}
                     },
@@ -381,13 +382,30 @@ pub fn schema() -> Value {
                 }
             }
         }
-    ])
+    ]);
+
+    if let Some(list) = all.as_array_mut() {
+        for tool in extra {
+            list.push(json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                }
+            }));
+        }
+    }
+    all
 }
 
 /// Deny by default: a name that is not on the list never reaches the Sandbox.
-pub fn check(tool: &str, safe_mode: bool) -> Result<()> {
+pub fn check(tool: &str, safe_mode: bool, extra: &[crate::mcp::McpTool]) -> Result<()> {
     if safe_mode {
         bail!("safe mode: tools are disabled (send /safe off to re-enable)");
+    }
+    if extra.iter().any(|t| t.name == tool) {
+        return Ok(());
     }
     if !ALLOWED.contains(&tool) {
         bail!("tool `{tool}` is not allowed");
@@ -449,27 +467,45 @@ mod tests {
 
     #[test]
     fn denies_unknown_and_safe_mode() {
-        assert!(check("bash", false).is_ok());
-        assert!(check("read", false).is_ok());
-        assert!(check("write", false).is_ok());
-        assert!(check("edit", false).is_ok());
-        assert!(check("patch", false).is_ok());
-        assert!(check("glob", false).is_ok());
-        assert!(check("grep", false).is_ok());
-        assert!(check("list", false).is_ok());
-        assert!(check("process_manage", false).is_ok());
-        assert!(check("execute_code", false).is_ok());
-        assert!(check("memory", false).is_ok());
-        assert!(check("skill", false).is_ok());
-        assert!(check("recall", false).is_ok());
-        assert!(check("manage_schedule", false).is_ok());
-        assert!(check("update_behavior", false).is_ok());
-        assert!(check("log_metric", false).is_ok());
-        assert!(check("query_metrics", false).is_ok());
-        assert!(check("web_fetch", false).is_ok());
-        assert!(check("web_search", false).is_ok());
-        assert!(check("nope", false).is_err());
-        assert!(check("bash", true).is_err());
+        assert!(check("bash", false, &[]).is_ok());
+        assert!(check("read", false, &[]).is_ok());
+        assert!(check("write", false, &[]).is_ok());
+        assert!(check("edit", false, &[]).is_ok());
+        assert!(check("patch", false, &[]).is_ok());
+        assert!(check("glob", false, &[]).is_ok());
+        assert!(check("grep", false, &[]).is_ok());
+        assert!(check("list", false, &[]).is_ok());
+        assert!(check("process_manage", false, &[]).is_ok());
+        assert!(check("execute_code", false, &[]).is_ok());
+        assert!(check("memory", false, &[]).is_ok());
+        assert!(check("skill", false, &[]).is_ok());
+        assert!(check("recall", false, &[]).is_ok());
+        assert!(check("manage_schedule", false, &[]).is_ok());
+        assert!(check("update_behavior", false, &[]).is_ok());
+        assert!(check("log_metric", false, &[]).is_ok());
+        assert!(check("query_metrics", false, &[]).is_ok());
+        assert!(check("web_fetch", false, &[]).is_ok());
+        assert!(check("web_search", false, &[]).is_ok());
+        assert!(check("nope", false, &[]).is_err());
+        assert!(check("bash", true, &[]).is_err());
+    }
+
+    #[test]
+    fn schema_lists_local_and_mcp_tools() {
+        let names = schema(&[]).to_string();
+        assert!(names.contains("\"memory\"") && names.contains("\"skill\""));
+        assert!(names.contains("\"execute_code\""));
+        let extra = vec![crate::mcp::McpTool {
+            name: "mcp__demo__echo".into(),
+            server: "demo".into(),
+            tool: "echo".into(),
+            description: "echo".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+            approval: false,
+        }];
+        assert!(schema(&extra).to_string().contains("mcp__demo__echo"));
+        assert!(check("mcp__demo__echo", false, &extra).is_ok());
+        assert!(check("mcp__other", false, &extra).is_err());
     }
 
     #[test]

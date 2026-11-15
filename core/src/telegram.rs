@@ -179,6 +179,18 @@ impl Tg {
         Ok(())
     }
 
+    /// Command output is not model markdown: send it literally.
+    pub async fn send_plain(&self, chat_id: i64, text: &str) -> Result<()> {
+        for chunk in chunks(text, TG_TEXT_LIMIT) {
+            self.call(
+                "sendMessage",
+                json!({"chat_id": chat_id, "text": chunk, "disable_web_page_preview": true}),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// The approval prompt: the keyboard goes on the last chunk.
     pub async fn send_approval(&self, chat_id: i64, text: &str, id: i64) -> Result<()> {
         let parts = chunks(text, TG_TEXT_LIMIT);
@@ -408,6 +420,14 @@ impl Streamer {
     /// Deliver the final text. False means "nothing was shown, send it as a
     /// normal message"; true means the streamer owns delivery.
     pub async fn finish(&self, text: &str) -> Result<bool> {
+        // The first send may still be in flight; without this wait finish sees
+        // no message id and main would post the answer a second time.
+        for _ in 0..40 {
+            if !self.state.lock().unwrap().pending {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let id = {
             let st = self.state.lock().unwrap();
             st.message_id

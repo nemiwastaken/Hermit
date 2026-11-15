@@ -123,11 +123,22 @@ pub fn changes(dir: &str) -> Result<String> {
 }
 
 /// The profile is USER.md in new installs and user_profile.md in older ones.
+/// If both exist, the newer one wins, so an agent that writes USER.md on an
+/// upgraded install is not ignored.
 pub fn profile_file(dir: &str) -> &'static str {
-    if Path::new(dir).join("USER.md").exists() {
-        "USER.md"
-    } else {
-        "user_profile.md"
+    let new = Path::new(dir).join("USER.md");
+    let old = Path::new(dir).join("user_profile.md");
+    match (new.exists(), old.exists()) {
+        (true, true) => {
+            let mtime = |p: &Path| p.metadata().and_then(|m| m.modified()).ok();
+            if mtime(&new) >= mtime(&old) {
+                "USER.md"
+            } else {
+                "user_profile.md"
+            }
+        }
+        (true, false) => "USER.md",
+        _ => "user_profile.md",
     }
 }
 

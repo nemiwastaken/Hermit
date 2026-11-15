@@ -182,6 +182,7 @@ fn clear(db: &Db, chat_id: i64) -> String {
         .and_then(|_| db.kv_del(&events::task_key(chat_id)))
         .and_then(|_| db.kv_del(&events::recap_key(chat_id)))
         .and_then(|_| db.kv_del(&events::recap_id_key(chat_id)))
+        .and_then(|_| db.kv_del(&events::summary_key(chat_id)))
         .and_then(|_| db.approval_clear(chat_id))
         .and_then(|_| sched::clear_pending(db, chat_id));
     match res {

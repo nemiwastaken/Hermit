@@ -7,6 +7,8 @@ No real internet: a local HTTP server plays the page.
 import http.server
 import ipaddress
 import json
+import os
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -179,6 +181,138 @@ class Search(unittest.TestCase):
     def test_query_is_clamped_before_the_child_runs(self):
         with self.assertRaises(ValueError):
             server.web_search({"query": "x" * (server.MAX_QUERY + 1)})
+
+
+class Mcp(unittest.TestCase):
+    def tearDown(self):
+        server.MCP_LIST = None
+        server.MCP_SERVERS.clear()
+
+    def test_rpc_accepts_json_and_picks_the_sse_response(self):
+        assert server._rpc(b'{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}', "application/json")[
+            "result"
+        ] == {"tools": []}
+        sse = (
+            b'event: message\ndata: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n'
+            b'event: message\ndata: {"jsonrpc":"2.0","id":2,"result":{"content":[]}}\n\n'
+        )
+        assert server._rpc(sse, "text/event-stream")["id"] == 2
+
+    def test_config_reads_headers_and_drops_hop_by_hop(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump([{
+                "name": "github",
+                "url": "https://example.com/mcp",
+                "approval": True,
+                "allow_private": True,
+                "headers": {"Authorization": "Bearer x", "Host": "evil", "Content-Length": "9"},
+            }], f)
+            path = f.name
+        try:
+            with mock.patch.object(server, "MCP_FILE", path):
+                cfg = server._mcp_config()
+        finally:
+            os.unlink(path)
+        self.assertEqual(cfg[0]["name"], "github")
+        self.assertTrue(cfg[0]["approval"])
+        self.assertTrue(cfg[0]["allow_private"])
+        self.assertEqual(cfg[0]["headers"], {"Authorization": "Bearer x"})
+
+    def test_empty_or_missing_config_means_no_tools(self):
+        server.MCP_SERVERS.clear()
+        with mock.patch.object(server, "MCP_FILE", "/nonexistent/hermit-mcp.json"):
+            out = server.mcp_list({})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["servers"], [])
+
+    def test_full_handshake_over_local_http(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            session = None
+
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                n = int(self.headers.get("content-length") or 0)
+                req = json.loads(self.rfile.read(n) or b"{}")
+                method = req.get("method")
+                if method == "notifications/initialized":
+                    self.send_response(202)
+                    self.send_header("content-length", "0")
+                    self.end_headers()
+                    return
+                if method == "initialize":
+                    out = {"jsonrpc": "2.0", "id": req["id"],
+                           "result": {"protocolVersion": "2025-06-18"}}
+                    self.send_response(200)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("Mcp-Session-Id", "s1")
+                elif method == "tools/list":
+                    out = {"jsonrpc": "2.0", "id": req["id"], "result": {"tools": [
+                        {"name": "echo", "description": "e",
+                         "inputSchema": {"type": "object", "properties": {}}}
+                    ]}}
+                    self.send_response(200)
+                    self.send_header("content-type", "application/json")
+                elif method == "tools/call":
+                    out = {"jsonrpc": "2.0", "id": req["id"], "result": {
+                        "content": [{"type": "text", "text": "hi"}]}}
+                    self.send_response(200)
+                    self.send_header("content-type", "text/event-stream")
+                else:
+                    out = {"jsonrpc": "2.0", "id": req["id"], "error": {"message": "no"}}
+                    self.send_response(200)
+                    self.send_header("content-type", "application/json")
+                raw = json.dumps(out).encode()
+                if self.headers.get("accept", "").find("event-stream") >= 0 and method == "tools/call":
+                    raw = b"data: " + raw + b"\n\n"
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{srv.server_address[1]}/mcp"
+        try:
+            with mock.patch.object(
+                server, "resolve_target",
+                return_value=(server.urlsplit(url), "127.0.0.1"),
+            ):
+                mcp = server._Mcp({
+                    "name": "demo", "url": url, "headers": {}, "approval": False,
+                })
+                tools = mcp.list_tools()
+                result = mcp.call("echo", {"x": 1})
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(tools[0]["name"], "echo")
+        self.assertEqual(result["content"][0]["text"], "hi")
+
+    def test_handshake_lists_tools_and_calls_one(self):
+        mcp = server._Mcp({
+            "name": "demo", "url": "https://e/mcp", "headers": {}, "approval": False,
+        })
+        replies = [
+            {"result": {"protocolVersion": "2025-06-18"}},
+            None,
+            {"result": {"tools": [{"name": "echo"}], "nextCursor": None}},
+            {"result": {"content": [{"type": "text", "text": "hi"}]}},
+        ]
+        with mock.patch.object(mcp, "_post", side_effect=replies) as post:
+            tools = mcp.list_tools()
+            result = mcp.call("echo", {"x": 1})
+        self.assertEqual(tools[0]["name"], "echo")
+        self.assertEqual(result["content"][0]["text"], "hi")
+        methods = [call.args[0].get("method") for call in post.call_args_list]
+        self.assertEqual(methods, ["initialize", "notifications/initialized",
+                                   "tools/list", "tools/call"])
+
+    def test_call_requires_server_and_tool(self):
+        with self.assertRaises(ValueError):
+            server.mcp_call({"server": "x"})
+        with self.assertRaises(ValueError):
+            server.mcp_call({"server": "missing", "tool": "t", "arguments": {}})
 
 
 if __name__ == "__main__":

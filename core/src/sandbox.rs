@@ -42,7 +42,9 @@ impl Sandbox {
         Err(last.unwrap_or_else(|| anyhow::anyhow!("sandbox unavailable")))
     }
 
-    async fn call_once(&self, id: &str, tool: &str, args: &Value) -> Result<Value> {
+    /// One attempt. Use it for tools that must not run twice when a reply is
+    /// lost: file writes, process start, MCP calls and execute_code.
+    pub async fn call_once(&self, id: &str, tool: &str, args: &Value) -> Result<Value> {
         let stream = UnixStream::connect(&self.socket)
             .await
             .with_context(|| format!("connecting to sandbox at {}", self.socket))?;

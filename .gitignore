@@ -3,3 +3,6 @@
 /core/target
 /core/data
 .env
+
+__pycache__/
+*.pyc

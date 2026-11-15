@@ -26,8 +26,12 @@ services:
     # The only way out to the internet. No workspace, no behavior, no database:
     # a page can only see what the model sends it.
     user: "${HERMIT_UID:-1000}:${HERMIT_GID:-1000}"
+    environment:
+      HERMIT_MCP_FILE: /etc/hermit/mcp.json
     volumes:
       - ${HERMIT_RUN_DIR:-./.dev/run}:/run/hermit
+      # Remote MCP servers are configured here; secrets stay on the host.
+      - ${HERMIT_MCP_CONFIG:-./.dev/mcp.json}:/etc/hermit/mcp.json:ro
     read_only: true
     tmpfs:
       - /tmp:size=64m

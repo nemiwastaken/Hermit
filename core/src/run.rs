@@ -53,6 +53,8 @@ pub struct Agent {
     pub db: Arc<Db>,
     pub flags: Arc<Flags>,
     pub behavior_dir: String,
+    /// Tools discovered from configured MCP servers at startup.
+    pub mcp: Vec<crate::mcp::McpTool>,
     /// Streaming edits and the typing indicator both need the bot.
     pub tg: Arc<crate::telegram::Tg>,
 }
@@ -244,7 +246,7 @@ impl Agent {
             let tools = if self.flags.safe() {
                 None
             } else {
-                Some(policy::schema())
+                Some(policy::schema(&self.mcp))
             };
             let reply = self.chat(chat_id, &history, tools.as_ref(), stream).await?;
             if let Some(u) = &reply.usage {
@@ -281,10 +283,16 @@ impl Agent {
                 return Ok((text, None));
             }
 
-            if let Some((risky, reason)) = calls
-                .iter()
-                .find_map(|c| policy::approval_reason(&c.name, &c.args).map(|r| (c, r)))
-            {
+            if let Some((risky, reason)) = calls.iter().find_map(|c| {
+                policy::approval_reason(&c.name, &c.args)
+                    .or_else(|| {
+                        self.mcp
+                            .iter()
+                            .any(|t| t.name == c.name && t.approval)
+                            .then_some("внешний MCP-инструмент")
+                    })
+                    .map(|r| (c, r))
+            }) {
                 let label = clamp(&preview(&risky.args), 300);
                 let calls_json: Vec<Value> = calls.iter().map(call_json).collect();
                 let id =
@@ -372,7 +380,7 @@ impl Agent {
     }
 
     async fn run_tool(&self, chat_id: i64, id: &str, name: &str, args: &Value) -> Value {
-        if let Err(e) = policy::check(name, self.flags.safe()) {
+        if let Err(e) = policy::check(name, self.flags.safe(), &self.mcp) {
             return json!({"ok": false, "error": format!("{e:#}")});
         }
         if name == "recall" {
@@ -412,13 +420,36 @@ impl Agent {
         if name == "query_metrics" {
             return metrics::query(&self.db, chat_id, args);
         }
+        if let Some(tool) = self.mcp.iter().find(|t| t.name == name) {
+            let call = json!({
+                "server": tool.server,
+                "tool": tool.tool,
+                "arguments": args,
+            });
+            // A retried MCP call may run twice: no automatic retry.
+            return match self.net.call_once(id, "mcp_call", &call).await {
+                Ok(v) => v,
+                Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+            };
+        }
         // The internet lives in its own container, not in the sandbox.
         let sandbox = if name == "web_fetch" || name == "web_search" {
             &self.net
         } else {
             &self.tools
         };
-        match sandbox.call(id, name, args).await {
+        // These tools have side effects or can run for minutes; a lost reply
+        // must not make core run them a second time.
+        let once = matches!(
+            name,
+            "write" | "edit" | "patch" | "process_manage" | "execute_code"
+        );
+        let result = if once {
+            sandbox.call_once(id, name, args).await
+        } else {
+            sandbox.call(id, name, args).await
+        };
+        match result {
             Ok(v) => v,
             Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
         }
@@ -932,8 +963,8 @@ fn trim(history: &mut Vec<Value>) {
     }
 }
 
-/// Rough size of what will be sent. Tool results dominate; 200 chars per
-/// message covers roles and call ids.
+/// Rough size of what will be sent, in bytes. Tool results dominate; 200
+/// bytes per message covers roles and call ids.
 fn history_chars(history: &[Value]) -> usize {
     history
         .iter()

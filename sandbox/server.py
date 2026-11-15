@@ -276,6 +276,7 @@ def process_manage(req_id, args):
             if not p:
                 raise ValueError(f"no process #{pid}")
             lines = min(max(int(args.get("lines") or 100), 1), 1000)
+            size = 0
             try:
                 size = os.path.getsize(p["log"])
                 with open(p["log"], "rb") as f:
@@ -449,6 +450,8 @@ def dispatch(req):
     req_id, tool, args = req.get("id"), req.get("tool"), req.get("args") or {}
     if not isinstance(args, dict):
         return {"id": req_id, "ok": False, "error": "args must be an object"}
+    if req.get("nested") and tool == "execute_code":
+        return {"id": req_id, "ok": False, "error": "execute_code cannot call itself"}
     try:
         if tool == "bash":
             return {"id": req_id, **bash(str(req_id), args)}

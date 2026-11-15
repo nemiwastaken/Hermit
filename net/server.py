@@ -28,6 +28,7 @@ import ssl
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlsplit
 
 import trafilatura
@@ -40,6 +41,11 @@ MAX_CHARS = 7_000
 SEARCH_TIMEOUT = 30          # ddgs has no overall cap of its own
 MAX_QUERY = 500
 MAX_URL = 2_000
+MCP_FILE = os.environ.get("HERMIT_MCP_FILE", "/etc/hermit/mcp.json")
+MCP_TIMEOUT = 30.0
+MCP_SERVERS = {}
+MCP_LIST = None
+MCP_LOCK = threading.Lock()
 
 # A plain desktop Firefox is less likely to get a bot page than a curl-looking UA.
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"
@@ -124,6 +130,260 @@ class _HTTPS(http.client.HTTPSConnection):
     def connect(self):
         sock = socket.create_connection((self._ip, self.port), self.timeout)
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def _post_once(url, payload, extra_headers, allow_private=False):
+    """POST with the same SSRF checks and IP pinning as GET."""
+    parts, ip = resolve_target(url, allow_private)
+    port = parts.port or (443 if parts.scheme.lower() == "https" else 80)
+    path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "User-Agent": USER_AGENT,
+        **extra_headers,
+    }
+    if parts.scheme.lower() == "https":
+        conn = _HTTPS(parts.hostname, ip, port, MCP_TIMEOUT, ssl.create_default_context())
+    else:
+        conn = _HTTP(parts.hostname, ip, port, MCP_TIMEOUT)
+    try:
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+        return resp.status, resp.headers, resp.read(MAX_BYTES + 1), url
+    finally:
+        conn.close()
+
+
+def _post_json(url, payload, extra_headers, allow_private=False):
+    for hop in range(4):
+        status, headers, body, final = _post_once(url, payload, extra_headers, allow_private)
+        location = headers.get("location")
+        if status in (301, 302, 303, 307, 308) and location:
+            if hop >= 3:
+                raise ValueError("more than 3 redirects")
+            url = urljoin(url, location)
+            continue
+        if len(body) > MAX_BYTES:
+            raise ValueError("MCP response is larger than 3 MB")
+        return status, headers, body, final
+    raise ValueError("redirect loop")
+
+
+def _rpc(raw, ctype):
+    text = raw.decode("utf-8", "replace")
+    if "text/event-stream" in (ctype or ""):
+        last = None
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                value = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and ("result" in value or "error" in value):
+                last = value
+        if last is None:
+            raise ValueError("MCP event stream had no response")
+        return last
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise ValueError(f"MCP returned non-JSON: {text[:200]!r}")
+
+
+def _mcp_headers(raw):
+    out = {}
+    for key, value in (raw or {}).items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        if key.lower() in ("host", "content-length", "connection"):
+            continue
+        out[key] = value
+    return out
+
+
+def _mcp_config():
+    try:
+        with open(MCP_FILE, encoding="utf-8") as f:
+            raw = f.read().strip()
+    except FileNotFoundError:
+        return []
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{MCP_FILE}: {e}")
+    if not isinstance(data, list):
+        raise ValueError(f"{MCP_FILE}: expected an array of servers")
+    out = []
+    for i, cfg in enumerate(data):
+        if not isinstance(cfg, dict):
+            raise ValueError(f"{MCP_FILE}: server {i + 1} must be an object")
+        name = str(cfg.get("name") or f"server{i + 1}")
+        url = str(cfg.get("url") or "")
+        if not url:
+            raise ValueError(f"{MCP_FILE}: server {name} has no url")
+        out.append({
+            "name": name,
+            "url": url,
+            "headers": _mcp_headers(cfg.get("headers")),
+            "approval": bool(cfg.get("approval")),
+            # Opt-in for a server on the LAN. Off by default: the same SSRF
+            # rule as web_fetch must not be bypassed by a stray config line.
+            "allow_private": bool(cfg.get("allow_private")),
+        })
+    return out
+
+
+class _Mcp:
+    """Minimal Streamable HTTP client: initialize, tools/list, tools/call.
+    Only remote HTTP servers: the net container cannot see a local process."""
+
+    def __init__(self, cfg):
+        self.name = cfg["name"]
+        self.url = cfg["url"]
+        self.headers = cfg["headers"]
+        self.approval = cfg["approval"]
+        self.allow_private = cfg.get("allow_private", False)
+        self.session = None
+        self.tools = None
+        self.ready = False
+        self.next_id = 0
+        self.protocol = "2025-06-18"
+
+    def _post(self, payload, want=True):
+        headers = dict(self.headers)
+        if self.session:
+            headers["Mcp-Session-Id"] = self.session
+        if self.ready:
+            headers["MCP-Protocol-Version"] = self.protocol
+        status, resp_headers, body, final = _post_json(
+            self.url, payload, headers, self.allow_private
+        )
+        session = resp_headers.get("Mcp-Session-Id")
+        if session:
+            self.session = session
+        if status >= 400:
+            raise ValueError(f"HTTP {status} from {final}: {body[:300]!r}")
+        if not want:
+            return None
+        return _rpc(body, resp_headers.get("Content-Type", ""))
+
+    def _rpc(self, method, params=None):
+        self.next_id += 1
+        payload = {"jsonrpc": "2.0", "id": self.next_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        response = self._post(payload)
+        if "error" in response:
+            raise ValueError(f"MCP error: {response['error']}")
+        return response.get("result") or {}
+
+    def start(self):
+        if self.ready:
+            return
+        self._post({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {
+                "protocolVersion": self.protocol,
+                "capabilities": {},
+                "clientInfo": {"name": "hermit", "version": "0.1"},
+            },
+        })
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"}, want=False)
+        self.ready = True
+
+    def list_tools(self):
+        if self.tools is not None:
+            return self.tools
+        self.start()
+        tools, cursor = [], None
+        for _ in range(10):
+            result = self._rpc("tools/list", {"cursor": cursor} if cursor else {})
+            tools.extend(result.get("tools") or [])
+            cursor = result.get("nextCursor")
+            if not cursor:
+                break
+        self.tools = tools
+        return tools
+
+    def call(self, tool, arguments):
+        self.start()
+        params = {"name": tool, "arguments": arguments}
+        try:
+            return self._rpc("tools/call", params)
+        except ValueError as e:
+            # A restarted server forgets the session; one fresh handshake is
+            # enough, and only when the failure looks like a dead session.
+            if self.session and ("HTTP 400" in str(e) or "HTTP 404" in str(e)):
+                self.ready = False
+                self.session = None
+                self.start()
+                return self._rpc("tools/call", params)
+            raise
+
+
+def _mcp_probe(cfg):
+    server = _Mcp(cfg)
+    MCP_SERVERS[server.name] = server
+    item = {"name": server.name, "approval": server.approval, "tools": []}
+    try:
+        for tool in server.list_tools():
+            item["tools"].append({
+                "name": str(tool.get("name") or ""),
+                "description": str(tool.get("description") or ""),
+                "inputSchema": tool.get("inputSchema") or {
+                    "type": "object", "properties": {},
+                },
+            })
+    except Exception as e:
+        item["error"] = f"{type(e).__name__}: {e}"
+    return item
+
+
+def mcp_list(args):
+    global MCP_LIST
+    with MCP_LOCK:
+        if MCP_LIST is None:
+            configs = _mcp_config()
+            # One slow server must not hold up the others at startup.
+            with ThreadPoolExecutor(max_workers=max(1, min(4, len(configs)))) as pool:
+                servers = list(pool.map(_mcp_probe, configs))
+            MCP_LIST = servers
+        return {"ok": True, "servers": MCP_LIST}
+
+
+def mcp_call(args):
+    name = args.get("server")
+    tool = args.get("tool")
+    if not isinstance(name, str) or not isinstance(tool, str) or not tool:
+        raise ValueError("server and tool are required")
+    server = MCP_SERVERS.get(name)
+    if server is None:
+        for cfg in _mcp_config():
+            if cfg["name"] == name:
+                server = MCP_SERVERS[name] = _Mcp(cfg)
+                break
+    if server is None:
+        raise ValueError(f"unknown MCP server {name!r}")
+    arguments = args.get("arguments") or {}
+    if not isinstance(arguments, dict):
+        raise ValueError("arguments must be an object")
+    result = server.call(tool, arguments)
+    return {
+        "ok": True,
+        "server": name,
+        "tool": tool,
+        "is_error": bool(result.get("isError")),
+        "content": result.get("content") or [],
+    }
 
 
 def _get_once(url, allow_private):
@@ -299,6 +559,10 @@ def dispatch(req):
             return {"id": req_id, **web_fetch(args)}
         if tool == "web_search":
             return {"id": req_id, **web_search(args)}
+        if tool == "mcp_list":
+            return {"id": req_id, **mcp_list(args)}
+        if tool == "mcp_call":
+            return {"id": req_id, **mcp_call(args)}
     except ValueError as e:
         return {"id": req_id, "ok": False, "error": str(e)}
     except Exception as e:  # surface any failure to the model, never crash

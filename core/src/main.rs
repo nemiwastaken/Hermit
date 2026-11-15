@@ -2,6 +2,7 @@ mod behavior;
 mod cmd;
 mod events;
 mod llm;
+mod mcp;
 mod md;
 mod metrics;
 mod policy;
@@ -43,10 +44,17 @@ async fn main() -> Result<()> {
     }
     let flags = Arc::new(Flags::new(safe_mode));
     let tg = Arc::new(Tg::from_env()?);
+    let net = Sandbox::with_timeout(&net_socket, 60);
+    // MCP discovery runs before Telegram polling; 15 seconds is enough for a
+    // container that is already up and does not hold the bot hostage at boot.
+    let mcp_net = Sandbox::with_timeout(&net_socket, 15);
+    let mcp = mcp::load(&mcp_net).await;
+    eprintln!("mcp: {} tool(s)", mcp.len());
     let agent = Arc::new(Agent {
         llm: llm::Llm::from_env()?,
         tools: Sandbox::new(&socket),
-        net: Sandbox::with_timeout(&net_socket, 60),
+        net,
+        mcp,
         db: db.clone(),
         flags: flags.clone(),
         behavior_dir,
@@ -148,9 +156,9 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
             // The reply to a fixed question is parsed before the model sees it.
             "telegram" => match sched::answer(&db, chat_id, &text) {
                 Some(answer) => Ok((answer, None)),
-                None => usual(&agent, &flags, &db, chat_id, &text, ev.id).await,
+                None => usual(&agent, &flags, &db, &tg, chat_id, &text, ev.id).await,
             },
-            _ => usual(&agent, &flags, &db, chat_id, &text, ev.id).await,
+            _ => usual(&agent, &flags, &db, &tg, chat_id, &text, ev.id).await,
         };
 
         typing.abort();
@@ -195,12 +203,18 @@ async fn usual(
     agent: &Agent,
     flags: &Flags,
     db: &Db,
+    tg: &Tg,
     chat_id: i64,
     text: &str,
     event_id: i64,
 ) -> Result<(String, Option<i64>)> {
     match cmd::handle(text, flags, db, chat_id, &agent.behavior_dir) {
-        Some(Cmd::Answer(answer)) => Ok((answer, None)),
+        // Data from SQLite and git is not markdown: no bold headings or
+        // interpreted asterisks in /memory, /sessions or /usage.
+        Some(Cmd::Answer(answer)) => {
+            tg.send_plain(chat_id, &answer).await?;
+            Ok((String::new(), None))
+        }
         Some(Cmd::NewSession) => agent.new_session(chat_id).await.map(|s| (s, None)),
         Some(Cmd::ResumeSession(id)) => agent.resume_session(chat_id, id).await.map(|s| (s, None)),
         Some(Cmd::Compress) => agent.compress(chat_id).await.map(|s| (s, None)),

@@ -166,8 +166,17 @@ HERMIT_GID=$RUN_GID
 HERMIT_RUN_DIR=$RUN_DIR
 HERMIT_WORKSPACE=$WORKSPACE
 HERMIT_BEHAVIOR=$PREFIX/behavior
+HERMIT_MCP_CONFIG=$PREFIX/mcp.json
 EOF
 chmod 644 "$PREFIX/.env"
+
+# MCP is opt-in: an empty array means no remote servers. Keep an existing file
+# on upgrade, it may hold tokens.
+if [ ! -f "$PREFIX/mcp.json" ]; then
+    printf '[]\n' > "$PREFIX/mcp.json"
+fi
+chown "$RUN_USER:$RUN_GID" "$PREFIX/mcp.json"
+chmod 600 "$PREFIX/mcp.json"
 
 # Earlier installs kept the config in /etc and the database in /var/lib. Move
 # them in once, so an upgrade does not lose the token or the queue. A leftover
@@ -196,7 +205,7 @@ if [ ! -d "$PREFIX/behavior/.git" ]; then
     as_user git -C "$PREFIX/behavior" \
         -c user.name=hermit -c user.email=hermit@localhost \
         commit -qm "initial behavior"
-    echo "   edit $PREFIX/behavior/user_profile.md and skills/*.md"
+    echo "   edit $PREFIX/behavior/ (USER.md, MEMORY.md, skills/*.md)"
 else
     say "keeping existing $PREFIX/behavior"
 fi
@@ -301,7 +310,8 @@ Hermit installed:
   version    $VERSION ($GIT_REV)
   binary     $PREFIX/bin/hermit
   containers $PREFIX/compose.yml -> hermit-sandbox (offline), hermit-net (internet)
-  behavior   $PREFIX/behavior (git repo)
+  behavior   $PREFIX/behavior (git repo: profile, MEMORY.md, skills)
+  mcp        $PREFIX/mcp.json (remote HTTP servers, [] = off)
   config     $CONF (mode 600)
   database   $DATA/hermit.db
   workspace  $WORKSPACE
