@@ -88,6 +88,20 @@ pub fn query(db: &Db, chat_id: i64, args: &Value) -> Value {
     })
 }
 
+/// A `report` template with `{avg}` (one decimal) and `{count}` filled in from
+/// SQLite. Runs in the worker, so the model never touches these numbers.
+pub fn report(db: &Db, chat_id: i64, key: &str, days: i64, template: &str) -> String {
+    let days = days.clamp(1, 3_650);
+    let since = (Utc::now() - Duration::days(days)).to_rfc3339();
+    match db.metric_stats(chat_id, key, Some(&since)) {
+        Ok(s) if s.count > 0 => template
+            .replace("{avg}", &format!("{:.1}", s.avg))
+            .replace("{count}", &s.count.to_string()),
+        Ok(_) => format!("За {days} дн. записей нет."),
+        Err(e) => format!("Не смог посчитать: {e:#}"),
+    }
+}
+
 fn key(args: &Value) -> Option<&str> {
     args["key"]
         .as_str()
@@ -176,6 +190,30 @@ mod tests {
         assert_eq!(
             query(&db, 7, &json!({"key": "weight", "since_days": 2}))["count"],
             2
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn report_fills_template_from_sqlite() {
+        let (db, dir) = db("report");
+        log(&db, 1, &json!({"key": "weight", "value_num": 80.0}));
+        log(&db, 1, &json!({"key": "weight", "value_num": 82.0}));
+        assert_eq!(
+            report(
+                &db,
+                1,
+                "weight",
+                7,
+                "Средний вес: {avg} кг ({count} записей)."
+            ),
+            "Средний вес: 81.0 кг (2 записей)."
+        );
+        assert_eq!(report(&db, 1, "pulse", 7, "{avg}"), "За 7 дн. записей нет.");
+        // Another chat never sees these rows.
+        assert_eq!(
+            report(&db, 2, "weight", 7, "{avg}"),
+            "За 7 дн. записей нет."
         );
         std::fs::remove_dir_all(&dir).ok();
     }

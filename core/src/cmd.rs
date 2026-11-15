@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::behavior;
 use crate::events::{self, Db};
 use crate::run::{APPROVAL_MINUTES, date};
+use crate::sched;
 
 /// Process-wide switches. Deliberately not stored in the DB or `behavior/`:
 /// a restart always comes back in a known state.
@@ -93,6 +94,9 @@ pub fn handle(text: &str, flags: &Flags, db: &Db, chat_id: i64, behavior_dir: &s
             if let Ok(Some(id)) = db.approval_pending(chat_id, APPROVAL_MINUTES) {
                 out.push_str(&format!("\nждёт подтверждения: #{id}"));
             }
+            if let Ok(Some(key)) = sched::pending(db, chat_id) {
+                out.push_str(&format!("\nждёт ответа: {key}"));
+            }
             Cmd::Answer(out)
         }
         "/dlq" => Cmd::Answer(dlq(db)),
@@ -117,7 +121,8 @@ fn clear(db: &Db, chat_id: i64) -> String {
         .and_then(|_| db.kv_del(&events::task_key(chat_id)))
         .and_then(|_| db.kv_del(&events::recap_key(chat_id)))
         .and_then(|_| db.kv_del(&events::recap_id_key(chat_id)))
-        .and_then(|_| db.approval_clear(chat_id));
+        .and_then(|_| db.approval_clear(chat_id))
+        .and_then(|_| sched::clear_pending(db, chat_id));
     match res {
         Ok(()) => "Контекст этого чата удалён, в архив он не попал. Архив не тронут.".into(),
         Err(e) => format!("Не смог очистить: {e:#}"),
@@ -343,6 +348,7 @@ mod tests {
         db.kv_set(&events::task_key(1), "fix docker").unwrap();
         db.kv_set(&events::recap_key(1), "recap").unwrap();
         db.approval_add(1, &[], "rm -rf", 0, &[]).unwrap();
+        sched::set_pending(&db, 1, "weight").unwrap();
 
         let listed = match handle("/sessions", &f, &db, 1, beh) {
             Some(Cmd::Answer(a)) => a,
@@ -387,6 +393,11 @@ mod tests {
             db.approval_pending(1, 60).unwrap(),
             None,
             "pending approval dropped"
+        );
+        assert_eq!(
+            sched::pending(&db, 1).unwrap(),
+            None,
+            "pending question dropped"
         );
 
         assert!(

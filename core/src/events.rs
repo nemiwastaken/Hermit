@@ -44,6 +44,22 @@ pub struct Schedule {
     pub text: String,
     pub next_at: String,
     pub repeat: String,
+    /// `prompt` goes to the model; `question` and `report` are sent by code.
+    pub kind: String,
+    pub metric_key: Option<String>,
+    /// Report window in days.
+    pub days: Option<i64>,
+}
+
+/// A new schedule row. A struct instead of seven arguments.
+pub struct NewSchedule<'a> {
+    pub chat_id: i64,
+    pub text: &'a str,
+    pub next_at: &'a str,
+    pub repeat: &'a str,
+    pub kind: &'a str,
+    pub metric_key: Option<&'a str>,
+    pub days: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +114,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/0003_schedules.sql"))?;
         conn.execute_batch(include_str!("../migrations/0004_metrics.sql"))?;
         conn.execute_batch(include_str!("../migrations/0005_approvals.sql"))?;
+        ensure_schedule_columns(&conn)?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
@@ -335,18 +352,21 @@ impl Db {
             .execute("DELETE FROM archive WHERE updated_at < ?1", params![cutoff])?)
     }
 
-    pub fn schedule_add(
-        &self,
-        chat_id: i64,
-        text: &str,
-        next_at: &str,
-        repeat: &str,
-    ) -> Result<i64> {
+    pub fn schedule_add(&self, s: &NewSchedule<'_>) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO schedules (chat_id, text, next_at, repeat, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![chat_id, text, next_at, repeat, now()],
+            "INSERT INTO schedules (chat_id, text, next_at, repeat, kind, metric_key, days, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                s.chat_id,
+                s.text,
+                s.next_at,
+                s.repeat,
+                s.kind,
+                s.metric_key,
+                s.days,
+                now()
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -354,7 +374,7 @@ impl Db {
     pub fn schedules(&self, chat_id: i64) -> Result<Vec<Schedule>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, text, next_at, repeat FROM schedules
+            "SELECT id, chat_id, text, next_at, repeat, kind, metric_key, days FROM schedules
              WHERE chat_id = ?1 ORDER BY next_at",
         )?;
         let rows = stmt.query_map(params![chat_id], schedule_row)?;
@@ -365,7 +385,7 @@ impl Db {
     pub fn due_schedules(&self, now: &str) -> Result<Vec<Schedule>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, text, next_at, repeat FROM schedules
+            "SELECT id, chat_id, text, next_at, repeat, kind, metric_key, days FROM schedules
              WHERE next_at <= ?1 ORDER BY next_at",
         )?;
         let rows = stmt.query_map(params![now], schedule_row)?;
@@ -657,7 +677,29 @@ fn schedule_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule> {
         text: r.get(2)?,
         next_at: r.get(3)?,
         repeat: r.get(4)?,
+        kind: r.get(5)?,
+        metric_key: r.get(6)?,
+        days: r.get(7)?,
     })
+}
+
+/// `ALTER TABLE ADD COLUMN` has no IF NOT EXISTS and the files above run on
+/// every open, so the new columns are checked instead of replayed.
+fn ensure_schedule_columns(conn: &rusqlite::Connection) -> Result<()> {
+    let names: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('schedules')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (name, decl) in [
+        ("kind", "TEXT NOT NULL DEFAULT 'prompt'"),
+        ("metric_key", "TEXT"),
+        ("days", "INTEGER"),
+    ] {
+        if !names.iter().any(|n| n == name) {
+            conn.execute_batch(&format!("ALTER TABLE schedules ADD COLUMN {name} {decl}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn now() -> String {
@@ -671,6 +713,11 @@ pub fn task_key(chat_id: i64) -> String {
 
 pub fn recap_key(chat_id: i64) -> String {
     format!("recap:{chat_id}")
+}
+
+/// Set while a fixed question waits for a numeric reply: the metric key.
+pub fn ask_key(chat_id: i64) -> String {
+    format!("ask:{chat_id}")
 }
 
 pub fn recap_id_key(chat_id: i64) -> String {
@@ -752,7 +799,15 @@ mod tests {
     fn schedules_roundtrip_due_and_isolation() {
         let (db, dir) = open("sched");
         let id = db
-            .schedule_add(1, "backup", "2026-01-01T10:00:00+00:00", "daily")
+            .schedule_add(&NewSchedule {
+                chat_id: 1,
+                text: "backup",
+                next_at: "2026-01-01T10:00:00+00:00",
+                repeat: "daily",
+                kind: "prompt",
+                metric_key: None,
+                days: None,
+            })
             .unwrap();
         assert_eq!(db.schedules(1).unwrap().len(), 1);
         assert!(db.schedules(2).unwrap().is_empty(), "chats are isolated");

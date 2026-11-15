@@ -117,19 +117,35 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
         let chat_id = payload["chat_id"].as_i64().unwrap_or(0);
         let text = payload["text"].as_str().unwrap_or("").to_string();
 
-        let outcome: Result<(String, Option<i64>)> = if ev.kind == "approval" {
-            let id = payload["id"].as_i64().unwrap_or(0);
-            let approve = payload["approve"].as_bool().unwrap_or(false);
-            agent.resume(chat_id, id, approve).await
-        } else {
-            match cmd::handle(&text, &flags, &db, chat_id, &agent.behavior_dir) {
-                Some(Cmd::Answer(answer)) => Ok((answer, None)),
-                Some(Cmd::NewSession) => agent.new_session(chat_id).await.map(|s| (s, None)),
-                Some(Cmd::ResumeSession(id)) => {
-                    agent.resume_session(chat_id, id).await.map(|s| (s, None))
-                }
-                None => agent.reply(ev.id, chat_id, &text).await,
+        let mut ask_after: Option<String> = None;
+        let outcome: Result<(String, Option<i64>)> = match ev.kind.as_str() {
+            "approval" => {
+                let id = payload["id"].as_i64().unwrap_or(0);
+                let approve = payload["approve"].as_bool().unwrap_or(false);
+                agent.resume(chat_id, id, approve).await
             }
+            // Fixed message, no model. Waiting for an answer starts only after
+            // it is delivered, so a failed send cannot swallow the next message.
+            "question" => {
+                ask_after = payload["key"].as_str().map(str::to_string);
+                Ok((text.clone(), None))
+            }
+            "report" => Ok((
+                metrics::report(
+                    &db,
+                    chat_id,
+                    payload["key"].as_str().unwrap_or(""),
+                    payload["days"].as_i64().unwrap_or(7),
+                    &text,
+                ),
+                None,
+            )),
+            // The reply to a fixed question is parsed before the model sees it.
+            "telegram" => match sched::answer(&db, chat_id, &text) {
+                Some(answer) => Ok((answer, None)),
+                None => usual(&agent, &flags, &db, chat_id, &text, ev.id).await,
+            },
+            _ => usual(&agent, &flags, &db, chat_id, &text, ev.id).await,
         };
 
         match outcome {
@@ -138,8 +154,15 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
                     Some(id) => tg.send_approval(chat_id, &answer, id).await,
                     None => tg.send(chat_id, &answer).await,
                 };
-                if let Err(e) = sent {
-                    eprintln!("reply to {chat_id}: {e:#}");
+                match sent {
+                    Ok(()) => {
+                        if let Some(key) = ask_after
+                            && let Err(e) = sched::set_pending(&db, chat_id, &key)
+                        {
+                            eprintln!("set ask: {e:#}");
+                        }
+                    }
+                    Err(e) => eprintln!("reply to {chat_id}: {e:#}"),
                 }
                 if let Err(e) = db.finish(ev.id) {
                     eprintln!("finish event {}: {e:#}", ev.id);
@@ -153,6 +176,23 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
                 }
             }
         }
+    }
+}
+
+/// Commands and the agent. A scheduled `prompt` lands here too.
+async fn usual(
+    agent: &Agent,
+    flags: &Flags,
+    db: &Db,
+    chat_id: i64,
+    text: &str,
+    event_id: i64,
+) -> Result<(String, Option<i64>)> {
+    match cmd::handle(text, flags, db, chat_id, &agent.behavior_dir) {
+        Some(Cmd::Answer(answer)) => Ok((answer, None)),
+        Some(Cmd::NewSession) => agent.new_session(chat_id).await.map(|s| (s, None)),
+        Some(Cmd::ResumeSession(id)) => agent.resume_session(chat_id, id).await.map(|s| (s, None)),
+        None => agent.reply(event_id, chat_id, text).await,
     }
 }
 

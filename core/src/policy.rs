@@ -74,15 +74,22 @@ pub fn schema() -> Value {
                 "name": "manage_schedule",
                 "description": "Create, list or delete reminders. The current local time is at the end of \
                      the system prompt; all times here are local. For create pass exactly one of at, \
-                     daily_at, weekly_at. The text is what you will receive when the reminder is due.",
+                     daily_at, weekly_at. kind=prompt (default) sends text to you when due. \
+                     kind=question sends the text to the user as is and records the numeric reply \
+                     under key, so no model is involved. kind=report sends the text with {avg} and \
+                     {count} filled from the key's metrics over the last days. Use question and \
+                     report for trackers the user wants exactly as written.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["create", "list", "delete"]},
-                        "text": {"type": "string", "description": "what to do/say when due, phrased at yourself"},
+                        "text": {"type": "string", "description": "the message to send, or a report template with {avg}/{count} and phrased at yourself only for kind=prompt"},
                         "at": {"type": "string", "description": "one-shot, local: YYYY-MM-DD HH:MM"},
                         "daily_at": {"type": "string", "description": "every day at HH:MM local"},
                         "weekly_at": {"type": "string", "description": "every week at \"mon HH:MM\" local"},
+                        "kind": {"type": "string", "enum": ["prompt", "question", "report"], "description": "default prompt"},
+                        "key": {"type": "string", "description": "metric key for question/report, e.g. weight"},
+                        "days": {"type": "integer", "description": "report window in days, default 7"},
                         "id": {"type": "integer", "description": "schedule id for delete"}
                     },
                     "required": ["action"]

@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Utc};
 use serde_json::{Value, json};
 
-use crate::events::Db;
+use crate::events::{self, Db, NewSchedule};
 use crate::run::date;
 
 /// `manage_schedule` entry point. The model passes local wall-clock time; the
@@ -27,16 +27,30 @@ pub fn handle(db: &Db, chat_id: i64, args: &Value) -> Value {
     }
 }
 
-/// Turn due rows into normal queue events. The agent then handles the text as
-/// if the user had sent it, context and tools included.
+/// Turn due rows into queue events. A `question` event is a fixed message and
+/// a `report` is computed from SQLite: both skip the model. `prompt` events go
+/// through the agent like before.
 pub fn enqueue_due(db: &Db) -> Result<usize> {
     let due = db.due_schedules(&Utc::now().to_rfc3339())?;
     let mut queued = 0;
     for s in due {
-        db.push_event(
-            "telegram",
-            &json!({"chat_id": s.chat_id, "text": s.text}).to_string(),
-        )?;
+        let (kind, payload) = match s.kind.as_str() {
+            "question" => (
+                "question",
+                json!({"chat_id": s.chat_id, "text": s.text, "key": s.metric_key}),
+            ),
+            "report" => (
+                "report",
+                json!({
+                    "chat_id": s.chat_id,
+                    "text": s.text,
+                    "key": s.metric_key,
+                    "days": s.days,
+                }),
+            ),
+            _ => ("prompt", json!({"chat_id": s.chat_id, "text": s.text})),
+        };
+        db.push_event(kind, &payload.to_string())?;
         match next_after(&s.next_at, &s.repeat, Local::now()) {
             Some(next) => db.schedule_advance(s.id, &next.to_rfc3339())?,
             None => {
@@ -54,8 +68,21 @@ fn create(db: &Db, chat_id: i64, args: &Value) -> Value {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     else {
-        return fail("text is required: what to send when the reminder is due");
+        return fail("text is required: the message to send, or a report template");
     };
+    let kind = arg(&args["kind"]).unwrap_or("prompt");
+    if !matches!(kind, "prompt" | "question" | "report") {
+        return fail("kind must be prompt, question or report");
+    }
+    // The same key rule as log_metric, so a question writes where a report reads.
+    let key = args["key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.chars().count() <= 64);
+    if kind != "prompt" && key.is_none() {
+        return fail("key is required for a question or a report");
+    }
+    let days = (kind == "report").then(|| args["days"].as_i64().unwrap_or(7).clamp(1, 3_650));
     let now = Local::now();
     let (next, repeat) = if let Some(s) = arg(&args["at"]) {
         let Some(t) = parse_at(s) else {
@@ -80,8 +107,22 @@ fn create(db: &Db, chat_id: i64, args: &Value) -> Value {
     };
 
     let next_at = next.with_timezone(&Utc).to_rfc3339();
-    match db.schedule_add(chat_id, text, &next_at, repeat) {
-        Ok(id) => json!({"ok": true, "id": id, "when": date(&next_at), "repeat": repeat}),
+    match db.schedule_add(&NewSchedule {
+        chat_id,
+        text,
+        next_at: &next_at,
+        repeat,
+        kind,
+        metric_key: key,
+        days,
+    }) {
+        Ok(id) => json!({
+            "ok": true,
+            "id": id,
+            "when": date(&next_at),
+            "repeat": repeat,
+            "kind": kind,
+        }),
         Err(e) => fail(format!("{e:#}")),
     }
 }
@@ -94,6 +135,9 @@ fn list(db: &Db, chat_id: i64) -> Value {
                 "text": s.text,
                 "when": date(&s.next_at),
                 "repeat": s.repeat,
+                "kind": s.kind,
+                "key": s.metric_key,
+                "days": s.days,
             })).collect::<Vec<_>>()
         }),
         Err(e) => fail(format!("{e:#}")),
@@ -106,6 +150,49 @@ fn fail(msg: impl Into<String>) -> Value {
 
 fn arg(v: &Value) -> Option<&str> {
     v.as_str().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// A fixed question was sent and this is the reply. A number is logged under
+/// the question's key; anything else stays a normal message for the agent.
+/// Either way the question is closed.
+pub fn answer(db: &Db, chat_id: i64, text: &str) -> Option<String> {
+    let key = db.kv_get(&events::ask_key(chat_id)).ok().flatten()?;
+    if let Err(e) = db.kv_del(&events::ask_key(chat_id)) {
+        eprintln!("clear ask: {e:#}");
+    }
+    let num = parse_number(text)?;
+    let ts = Utc::now().to_rfc3339();
+    match db.metric_add(chat_id, &key, Some(num), None, "{}", &ts) {
+        Ok(_) => Some(format!("Записал: {}.", text.trim())),
+        Err(e) => Some(format!("Не смог записать: {e:#}")),
+    }
+}
+
+pub fn pending(db: &Db, chat_id: i64) -> Result<Option<String>> {
+    db.kv_get(&events::ask_key(chat_id))
+}
+
+pub fn set_pending(db: &Db, chat_id: i64, key: &str) -> Result<()> {
+    db.kv_set(&events::ask_key(chat_id), key)
+}
+
+pub fn clear_pending(db: &Db, chat_id: i64) -> Result<()> {
+    db.kv_del(&events::ask_key(chat_id))
+}
+
+/// The whole message is one number, optionally followed by kg. "82.5 вчера"
+/// is not a weight: it goes to the agent, which can still log it itself.
+fn parse_number(text: &str) -> Option<f64> {
+    let mut t = text.trim().to_lowercase();
+    t = t.trim_end_matches(&['.', '!'][..]).trim().to_string();
+    for unit in ["кг", "kg"] {
+        if let Some(rest) = t.strip_suffix(unit) {
+            t = rest.trim().to_string();
+            break;
+        }
+    }
+    let v: f64 = t.replace(',', ".").parse().ok()?;
+    v.is_finite().then_some(v)
 }
 
 /// "YYYY-MM-DD HH:MM", "YYYY-MM-DDTHH:MM" or with seconds, in local time.
@@ -265,10 +352,26 @@ mod tests {
         let db = Db::open(dir.join("t.db").to_str().unwrap()).unwrap();
 
         let once = db
-            .schedule_add(1, "разовое", "2020-01-01T00:00:00+00:00", "none")
+            .schedule_add(&NewSchedule {
+                chat_id: 1,
+                text: "разовое",
+                next_at: "2020-01-01T00:00:00+00:00",
+                repeat: "none",
+                kind: "prompt",
+                metric_key: None,
+                days: None,
+            })
             .unwrap();
         let daily = db
-            .schedule_add(1, "каждый день", "2020-01-01T10:00:00+00:00", "daily")
+            .schedule_add(&NewSchedule {
+                chat_id: 1,
+                text: "каждый день",
+                next_at: "2020-01-01T10:00:00+00:00",
+                repeat: "daily",
+                kind: "prompt",
+                metric_key: None,
+                days: None,
+            })
             .unwrap();
         assert_eq!(enqueue_due(&db).unwrap(), 2);
         assert_eq!(db.queue_len().unwrap(), 2);
@@ -284,6 +387,130 @@ mod tests {
         assert_ne!(once, daily);
 
         assert_eq!(enqueue_due(&db).unwrap(), 0, "nothing due right away");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn numeric_answers_parse_alone() {
+        assert_eq!(parse_number("82.5"), Some(82.5));
+        assert_eq!(parse_number("82,5 кг"), Some(82.5));
+        assert_eq!(parse_number(" 80 KG. "), Some(80.0));
+        assert_eq!(parse_number("82.5!"), Some(82.5));
+        assert_eq!(
+            parse_number("82.5 вчера"),
+            None,
+            "words mean a normal message"
+        );
+        assert_eq!(parse_number("напомни в 10"), None);
+        assert_eq!(parse_number("кг"), None);
+        assert_eq!(parse_number(""), None);
+    }
+
+    #[test]
+    fn numeric_reply_is_logged_and_closes_the_question() {
+        let dir = std::env::temp_dir().join(format!("hermit-ask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(dir.join("t.db").to_str().unwrap()).unwrap();
+
+        set_pending(&db, 1, "weight").unwrap();
+        assert_eq!(
+            answer(&db, 1, "82,5 кг").as_deref(),
+            Some("Записал: 82,5 кг.")
+        );
+        let stats = db.metric_stats(1, "weight", None).unwrap();
+        assert_eq!(stats.count, 1);
+        assert_eq!(stats.last_num, Some(82.5));
+        assert_eq!(pending(&db, 1).unwrap(), None, "question is closed");
+        assert_eq!(answer(&db, 1, "81"), None, "no question waits for this");
+
+        // A reply that is not a number goes to the agent and also closes it.
+        set_pending(&db, 1, "weight").unwrap();
+        assert_eq!(answer(&db, 1, "напомни в 10"), None);
+        assert_eq!(pending(&db, 1).unwrap(), None);
+        assert_eq!(db.metric_stats(1, "weight", None).unwrap().count, 1);
+
+        // Another chat is not affected by this one's question.
+        set_pending(&db, 1, "weight").unwrap();
+        assert_eq!(answer(&db, 2, "90"), None);
+        assert_eq!(pending(&db, 1).unwrap().as_deref(), Some("weight"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn questions_and_reports_need_a_key_and_keep_their_kind() {
+        let dir = std::env::temp_dir().join(format!("hermit-kind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(dir.join("t.db").to_str().unwrap()).unwrap();
+
+        let out = handle(
+            &db,
+            1,
+            &json!({"action":"create","kind":"question","text":"Сколько весишь?","daily_at":"07:00"}),
+        );
+        assert_eq!(out["ok"], false, "key is required");
+        assert_eq!(
+            handle(
+                &db,
+                1,
+                &json!({"action":"create","kind":"nope","text":"x","daily_at":"07:00"})
+            )["ok"],
+            false
+        );
+
+        assert_eq!(
+            handle(
+                &db,
+                1,
+                &json!({
+                    "action":"create","kind":"question","key":"weight",
+                    "text":"Доброе утро. Сколько весишь?","daily_at":"07:00"
+                })
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            handle(
+                &db,
+                1,
+                &json!({
+                    "action":"create","kind":"report","key":"weight","days":7,
+                    "text":"Средний вес: {avg} кг ({count} записей).","weekly_at":"sun 21:00"
+                })
+            )["ok"],
+            true
+        );
+        let rows = db.schedules(1).unwrap();
+        assert_eq!(rows[0].kind, "question");
+        assert_eq!(rows[0].metric_key.as_deref(), Some("weight"));
+        assert_eq!(rows[0].days, None);
+        assert_eq!(rows[1].kind, "report");
+        assert_eq!(rows[1].days, Some(7));
+
+        // Due rows keep their kind in the queue.
+        for (kind, key, text) in [
+            ("question", Some("weight"), "Сколько весишь?"),
+            ("report", Some("weight"), "Средний вес: {avg}"),
+            ("prompt", None, "обычное напоминание"),
+        ] {
+            db.schedule_add(&NewSchedule {
+                chat_id: 1,
+                text,
+                next_at: "2020-01-01T00:00:00+00:00",
+                repeat: "none",
+                kind,
+                metric_key: key,
+                days: (kind == "report").then_some(7),
+            })
+            .unwrap();
+        }
+        assert_eq!(enqueue_due(&db).unwrap(), 3);
+        let mut kinds = Vec::new();
+        while let Some(ev) = db.claim_event().unwrap() {
+            kinds.push(ev.kind);
+        }
+        assert!(kinds.contains(&"question".to_string()));
+        assert!(kinds.contains(&"report".to_string()));
+        assert!(kinds.contains(&"prompt".to_string()));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
