@@ -137,8 +137,14 @@ if [ "$SKIP_BUILD" -eq 0 ] && [ "$UNCHANGED" -eq 0 ]; then
     [ -x "$CARGO" ] || die "cargo not found for $RUN_USER. Install Rust (https://rustup.rs) or pass --skip-build"
     as_user "$CARGO" build --release --manifest-path "$REPO/core/Cargo.toml"
 fi
-BIN="$REPO/core/target/release/hermit"
-[ -x "$BIN" ] || BIN="$PREFIX/bin/hermit"
+# When nothing changed the installed binary is the trustworthy one: the local
+# target/ may be left over from another branch.
+if [ "$UNCHANGED" -eq 1 ]; then
+    BIN="$PREFIX/bin/hermit"
+else
+    BIN="$REPO/core/target/release/hermit"
+    [ -x "$BIN" ] || BIN="$PREFIX/bin/hermit"
+fi
 [ -x "$BIN" ] || die "no binary: build it first, or point --skip-build at an existing $PREFIX/bin/hermit"
 
 # ---------------------------------------------------------------- layout
@@ -293,9 +299,15 @@ Hermit installed:
   config     $CONF (mode 600)
   database   $DATA/hermit.db
   workspace  $WORKSPACE
+EOF
+
+# Nothing to do on a bot that already has its owner.
+if ! grep -qE '^TELEGRAM_ALLOWED_(USER|CHAT)_IDS=[0-9]' "$CONF" 2>/dev/null; then
+    cat <<EOF
 
 Next:
   1. write to your bot in a private chat: it replies with your user id
   2. put that id into TELEGRAM_ALLOWED_USER_IDS in $CONF
   3. systemctl restart hermit
 EOF
+fi
