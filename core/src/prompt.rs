@@ -10,6 +10,9 @@ pub fn system(behavior_dir: &str) -> String {
            the machine, run a command.\n\
          - Keep answers short; put raw output in a code block only when it matters.\n\
          - Files live in /workspace. Writes happen through the bash tool.\n\
+         - Earlier conversations are archived. If the user asks about something that is not in \
+           the current conversation, search the archive with recall(query=\"…\") instead of \
+           guessing or saying there is nothing.\n\
          - If a tool fails, read the error and fix the command once; then report the failure.\n",
     );
 

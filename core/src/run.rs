@@ -251,7 +251,16 @@ impl Agent {
         );
         let msgs = [json!({"role": "user", "content": prompt})];
         match self.llm.chat(&msgs, None).await {
-            Ok(r) => !is_new(r.message["content"].as_str().unwrap_or("")),
+            Ok(r) => {
+                let answer = r.message["content"].as_str().unwrap_or("");
+                let new = is_new(answer);
+                eprintln!(
+                    "context: {:?} -> {}",
+                    answer.trim(),
+                    if new { "NEW" } else { "CONTINUE" }
+                );
+                !new
+            }
             Err(e) => {
                 eprintln!("classifier failed, staying in context: {e:#}");
                 true
@@ -294,6 +303,7 @@ impl Agent {
             history,
             &last_activity,
         )?;
+        eprintln!("archived: «{title}»");
         self.clear_session(chat_id)?;
         Ok(Some(title))
     }
@@ -367,6 +377,7 @@ impl Agent {
         else {
             return Ok(None);
         };
+        eprintln!("recall: matched archive #{} «{}»", info.id, info.title);
         let text = clamp(
             &format!(
                 "[Прошлая сессия #{} «{}», {}]\nЗадача: {}\nФинальный ответ: {}\n\
