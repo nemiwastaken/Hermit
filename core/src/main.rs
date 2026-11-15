@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let safe_mode = std::env::args().any(|a| a == "--safe-mode");
     let db_path = env_or("DATABASE_PATH", "./data/hermit.db");
-    let socket = env_or("SANDBOX_SOCKET", "/srv/hermit/run/sandbox.sock");
+    let socket = env_or("SANDBOX_SOCKET", "/opt/hermit/run/sandbox.sock");
     let behavior_dir = env_or("BEHAVIOR_DIR", "./behavior");
 
     let db = Db::open(&db_path)?;

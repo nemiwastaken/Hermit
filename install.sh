@@ -8,14 +8,15 @@
 # Upgrade = run it again. The config, the database and behavior/ are never
 # overwritten, and the binary is swapped atomically so a failure in an earlier
 # step leaves the previous version running.
-# Layout (the systemd unit assumes these default paths):
-#   /opt/hermit/bin/hermit        binary
-#   /opt/hermit/sandbox/          Dockerfile + server.py for the sandbox image
-#   /opt/hermit/behavior/         your git repo: profile + skills
-#   /etc/hermit/hermit.env        secrets and paths (mode 600)
-#   /var/lib/hermit/              SQLite database
-#   /srv/hermit/run/              socket
-#   /srv/hermit/workspace/        where the agent works
+# Everything lives under one prefix, PREFIX=/opt/hermit by default:
+#   bin/hermit        binary
+#   sandbox/          Dockerfile + server.py for the sandbox image
+#   behavior/         your git repo: profile + skills
+#   hermit.env        secrets and paths (mode 600)
+#   data/hermit.db    SQLite database
+#   run/              socket
+#   workspace/        where the agent works
+# Only the systemd unit sits outside: systemd only reads /etc.
 
 set -euo pipefail
 
@@ -35,9 +36,10 @@ if [ -z "${BASH_SOURCE[0]:-}" ]; then
 fi
 
 PREFIX="${PREFIX:-/opt/hermit}"
-CONF_DIR="${CONF_DIR:-/etc/hermit}"
-DATA_DIR="${DATA_DIR:-/var/lib/hermit}"
-SRV_DIR="${SRV_DIR:-/srv/hermit}"
+CONF="$PREFIX/hermit.env"
+DATA="$PREFIX/data"
+RUN_DIR="$PREFIX/run"
+WORKSPACE="$PREFIX/workspace"
 UNIT=/etc/systemd/system/hermit.service
 
 NO_SYSTEMD=0
@@ -108,9 +110,9 @@ BIN="$REPO/core/target/release/hermit"
 # ---------------------------------------------------------------- layout
 say "creating directories"
 install -d -m 755 "$PREFIX" "$PREFIX/bin" "$PREFIX/sandbox"
-install -d -m 700 -o root -g root "$DATA_DIR"
-install -d -m 700 -o "$RUN_USER" -g "$RUN_GID" "$SRV_DIR/run"
-install -d -m 755 -o "$RUN_USER" -g "$RUN_GID" "$SRV_DIR/workspace"
+install -d -m 700 -o root -g root "$DATA"
+install -d -m 700 -o "$RUN_USER" -g "$RUN_GID" "$RUN_DIR"
+install -d -m 755 -o "$RUN_USER" -g "$RUN_GID" "$WORKSPACE"
 
 install -m 644 "$REPO/sandbox/server.py" "$REPO/sandbox/Dockerfile" "$PREFIX/sandbox/"
 install -m 644 "$REPO/compose.yml" "$PREFIX/compose.yml"
@@ -119,11 +121,27 @@ cat > "$PREFIX/.env" <<EOF
 # Written by install.sh: paths and the uid the sandbox runs as.
 HERMIT_UID=$RUN_UID
 HERMIT_GID=$RUN_GID
-HERMIT_RUN_DIR=$SRV_DIR/run
-HERMIT_WORKSPACE=$SRV_DIR/workspace
+HERMIT_RUN_DIR=$RUN_DIR
+HERMIT_WORKSPACE=$WORKSPACE
 HERMIT_BEHAVIOR=$PREFIX/behavior
 EOF
 chmod 644 "$PREFIX/.env"
+
+# Earlier installs kept the config in /etc and the database in /var/lib. Move
+# them in once, so an upgrade does not lose the token or the queue. A leftover
+# /srv/hermit is harmless: the container recreates socket and workspace.
+if [ -e /etc/hermit/hermit.env ] || [ -e /var/lib/hermit/hermit.db ]; then
+    say "moving the old split layout into $PREFIX"
+    systemctl stop hermit 2>/dev/null || true
+    if [ ! -f "$CONF" ] && [ -f /etc/hermit/hermit.env ]; then
+        mv /etc/hermit/hermit.env "$CONF"
+        rmdir /etc/hermit 2>/dev/null || true
+    fi
+    if [ ! -f "$DATA/hermit.db" ] && [ -f /var/lib/hermit/hermit.db ]; then
+        mv /var/lib/hermit/hermit.db* "$DATA/"
+        rmdir /var/lib/hermit 2>/dev/null || true
+    fi
+fi
 
 # ---------------------------------------------------------------- behavior
 if [ ! -d "$PREFIX/behavior/.git" ]; then
@@ -142,14 +160,15 @@ else
 fi
 
 # ---------------------------------------------------------------- config
-if [ ! -f "$CONF_DIR/hermit.env" ]; then
-    say "writing $CONF_DIR/hermit.env"
-    install -d -m 700 "$CONF_DIR"
-    sed -e "s|^DATABASE_PATH=.*|DATABASE_PATH=$DATA_DIR/hermit.db|" \
-        -e "s|^SANDBOX_SOCKET=.*|SANDBOX_SOCKET=$SRV_DIR/run/sandbox.sock|" \
-        -e "s|^BEHAVIOR_DIR=.*|BEHAVIOR_DIR=$PREFIX/behavior|" \
-        "$REPO/install/hermit.env.example" > "$CONF_DIR/hermit.env"
-    chmod 600 "$CONF_DIR/hermit.env"
+PATHS=(
+    -e "s|^DATABASE_PATH=.*|DATABASE_PATH=$DATA/hermit.db|"
+    -e "s|^SANDBOX_SOCKET=.*|SANDBOX_SOCKET=$RUN_DIR/sandbox.sock|"
+    -e "s|^BEHAVIOR_DIR=.*|BEHAVIOR_DIR=$PREFIX/behavior|"
+)
+if [ ! -f "$CONF" ]; then
+    say "writing $CONF"
+    sed "${PATHS[@]}" "$REPO/install/hermit.env.example" > "$CONF"
+    chmod 600 "$CONF"
 
     if [ -t 0 ]; then
         read -r -p "Telegram bot token: " tg_token || true
@@ -157,19 +176,21 @@ if [ ! -f "$CONF_DIR/hermit.env" ]; then
         read -r -p "Allowed chat ids, comma separated (blank = ask the bot for yours): " chats || true
         esc() { printf '%s' "$1" | sed 's/[&/\]/\\&/g'; }
         if [ -n "${tg_token:-}" ]; then
-            sed -i "s|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=$(esc "$tg_token")|" "$CONF_DIR/hermit.env"
+            sed -i "s|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=$(esc "$tg_token")|" "$CONF"
         fi
         if [ -n "${llm_key:-}" ]; then
-            sed -i "s|^LLM_API_KEY=.*|LLM_API_KEY=$(esc "$llm_key")|" "$CONF_DIR/hermit.env"
+            sed -i "s|^LLM_API_KEY=.*|LLM_API_KEY=$(esc "$llm_key")|" "$CONF"
         fi
         if [ -n "${chats:-}" ]; then
-            sed -i "s|^TELEGRAM_ALLOWED_CHAT_IDS=.*|TELEGRAM_ALLOWED_CHAT_IDS=$(esc "$chats")|" "$CONF_DIR/hermit.env"
+            sed -i "s|^TELEGRAM_ALLOWED_CHAT_IDS=.*|TELEGRAM_ALLOWED_CHAT_IDS=$(esc "$chats")|" "$CONF"
         fi
     else
-        echo "   non-interactive: fill in $CONF_DIR/hermit.env afterwards"
+        echo "   non-interactive: fill in $CONF afterwards"
     fi
 else
-    say "keeping existing $CONF_DIR/hermit.env"
+    say "keeping existing $CONF"
+    # The paths belong to the install, not to the config: keep them pointing here.
+    sed -i "${PATHS[@]}" "$CONF"
 fi
 
 # ---------------------------------------------------------------- sandbox
@@ -193,7 +214,8 @@ fi
 # ---------------------------------------------------------------- service
 if [ "$NO_SYSTEMD" -eq 0 ]; then
     say "installing hermit.service"
-    install -m 644 "$REPO/core/systemd/hermit.service" "$UNIT"
+    sed "s|@PREFIX@|$PREFIX|g" "$REPO/core/systemd/hermit.service" > "$UNIT"
+    chmod 644 "$UNIT"
     systemctl daemon-reload
     systemctl enable hermit >/dev/null
     if [ "$NO_START" -eq 0 ]; then
@@ -215,12 +237,12 @@ Hermit installed:
   binary     $PREFIX/bin/hermit
   sandbox    $PREFIX/compose.yml -> container hermit-sandbox
   behavior   $PREFIX/behavior (git repo)
-  config     $CONF_DIR/hermit.env
-  database   $DATA_DIR/hermit.db
-  workspace  $SRV_DIR/workspace
+  config     $CONF (mode 600)
+  database   $DATA/hermit.db
+  workspace  $WORKSPACE
 
 Next:
   1. write to your bot: it replies with your chat id
-  2. put that id into TELEGRAM_ALLOWED_CHAT_IDS in $CONF_DIR/hermit.env
+  2. put that id into TELEGRAM_ALLOWED_CHAT_IDS in $CONF
   3. systemctl restart hermit
 EOF

@@ -8,21 +8,20 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-# Root: it connects to the sandbox socket and writes /var/lib/hermit.
+# Root: it connects to the sandbox socket and writes @PREFIX@/data.
 # Untrusted code runs in the container, never here.
 User=root
-WorkingDirectory=/opt/hermit
-EnvironmentFile=/etc/hermit/hermit.env
-ExecStart=/opt/hermit/bin/hermit
+WorkingDirectory=@PREFIX@
+EnvironmentFile=@PREFIX@/hermit.env
+ExecStart=@PREFIX@/bin/hermit
 Restart=on-failure
 RestartSec=5
 
-StateDirectory=hermit
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
 NoNewPrivileges=yes
-ReadWritePaths=/var/lib/hermit /srv/hermit/run
+ReadWritePaths=@PREFIX@/data @PREFIX@/run
 
 [Install]
 WantedBy=multi-user.target

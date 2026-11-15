@@ -16,7 +16,7 @@ shell, a git-tracked behavior layer, and an LLM-only core.
 | **Ядро** `core/` | соединение с LLM: собирает контекст, вызывает модель, разбирает tool-calls, ведёт очередь и Telegram | бинарник на хосте, systemd | только ты, через git репозитория |
 | **Поведение** `behavior/` | профиль и скиллы: файлы, которые попадают в системный промпт | отдельный git-репо, `/opt/hermit/behavior` | агент через `update_behavior` (срез 3), ты — руками |
 | **Песочница** `sandbox/` | исполняет `bash` и читает файлы, обрезает вывод | Docker-контейнер без сети | никто напрямую: только через сокет |
-| **Рабочая папка** `workspace/` | всё, с чем работает агент: проекты, конфиги, результаты | `/srv/hermit/workspace` | агент |
+| **Рабочая папка** `workspace/` | всё, с чем работает агент: проекты, конфиги, результаты | `/opt/hermit/workspace` | агент |
 
 В репозитории лежат только `core/`, `sandbox/` и установщик. `behavior/` и
 `workspace/` — это данные запущенного экземпляра, они создаются при установке;
@@ -28,12 +28,12 @@ shell, a git-tracked behavior layer, and an LLM-only core.
 
 ```
 Telegram ⇄ ядро (Rust, systemd, БД SQLite)
-                │  JSON-строка на /srv/hermit/run/sandbox.sock
+                │  JSON-строка на /opt/hermit/run/sandbox.sock
                 ▼
         песочница (Docker: network none, read-only, cap_drop ALL)
                 │
                 ▼
-        /srv/hermit/workspace + behavior/:ro
+        /opt/hermit/workspace + behavior/:ro
 ```
 
 ## Что умеет сейчас
@@ -97,18 +97,24 @@ sudo ./install.sh
 
 Повторный запуск — это обновление: конфиг, база и `behavior/` не перезаписываются.
 
-После установки:
+После установки всё лежит в одном каталоге — `/opt/hermit`, кроме юнита systemd
+(другого места systemd не читает):
 
 ```
 /opt/hermit/bin/hermit        бинарник ядра
 /opt/hermit/sandbox/          Dockerfile и server.py песочницы
 /opt/hermit/behavior/         твой git-репо: профиль и скиллы
 /opt/hermit/compose.yml       описание контейнера песочницы
-/etc/hermit/hermit.env        секреты и пути, режим 600
-/var/lib/hermit/hermit.db     база (очередь и история чатов)
-/srv/hermit/run/              сокет
-/srv/hermit/workspace/        рабочая папка агента
+/opt/hermit/.env              пути и uid для compose
+/opt/hermit/hermit.env        секреты и пути, режим 600
+/opt/hermit/data/hermit.db    база (очередь и история чатов)
+/opt/hermit/run/              сокет
+/opt/hermit/workspace/        рабочая папка агента
+/etc/systemd/system/hermit.service
 ```
+
+Другой префикс: `sudo PREFIX=/srv/agent ./install.sh` — пути в конфиге и юните
+подставятся сами.
 
 ### Обновление
 
@@ -136,7 +142,7 @@ systemctl status hermit
 ### Первый запуск бота
 
 1. Напиши боту в Telegram. Если твой чат не разрешён, он ответит его id.
-2. Впиши id в `TELEGRAM_ALLOWED_CHAT_IDS` в `/etc/hermit/hermit.env`.
+2. Впиши id в `TELEGRAM_ALLOWED_CHAT_IDS` в `/opt/hermit/hermit.env`.
 3. `sudo systemctl restart hermit`.
 4. Проверка: «что лежит в /workspace?».
 
@@ -144,7 +150,7 @@ systemctl status hermit
 
 ## Настройка
 
-Всё в `/etc/hermit/hermit.env` (переменные окружения, формат `KEY=value`):
+Всё в `/opt/hermit/hermit.env` (переменные окружения, формат `KEY=value`):
 
 | Переменная | По умолчанию | Смысл |
 |---|---|---|
@@ -154,12 +160,12 @@ systemctl status hermit
 | `LLM_API_KEY` | — | ключ провайдера, обязателен |
 | `LLM_MODEL` | `deepseek-chat` | модель |
 | `LLM_MAX_TOKENS` | не задано | ограничение ответа |
-| `DATABASE_PATH` | `/var/lib/hermit/hermit.db` | SQLite |
-| `SANDBOX_SOCKET` | `/srv/hermit/run/sandbox.sock` | сокет песочницы |
+| `DATABASE_PATH` | `/opt/hermit/data/hermit.db` | SQLite |
+| `SANDBOX_SOCKET` | `/opt/hermit/run/sandbox.sock` | сокет песочницы |
 | `BEHAVIOR_DIR` | `/opt/hermit/behavior` | откуда читать профиль и скиллы |
 
-Пути в юните systemd рассчитаны на раскладку по умолчанию. Если переносишь
-каталоги — правь и `/etc/systemd/system/hermit.service`.
+Пути в юните systemd подставляет установщик — они совпадают с `PREFIX`. Если
+переносишь каталог руками, правь и `/etc/systemd/system/hermit.service`.
 
 ## Команды
 
@@ -192,7 +198,7 @@ cd core && cargo run --release
 ```
 
 `rm -rf .dev` — и от запуска не осталось следов. В продакшене те же роли играют
-`/srv/hermit/run`, `/srv/hermit/workspace`, `/var/lib/hermit` и `/opt/hermit/behavior`.
+`run/`, `workspace/`, `data/` и `behavior/` внутри `PREFIX`.
 
 Тесты:
 
@@ -243,14 +249,14 @@ install/hermit.env.example  шаблон боевого конфига
   `no-new-privileges`, без секретов внутри. Наружу из неё не выйти.
 - Белый список чатов: бот игнорирует всех, кроме перечисленных id. Без него
   любой, кто узнал адрес бота, получил бы доступ к серверу.
-- Секреты живут только в `/etc/hermit/hermit.env` (600) и не попадают ни в
+- Секреты живут только в `/opt/hermit/hermit.env` (600) и не попадают ни в
   `behavior/`, ни в контейнер.
 - `behavior/` примонтирован в песочницу только для чтения.
 - Инструменты перечислены в `core/src/policy.rs` явно; всё остальное — отказ.
 
 Что надо знать:
 
-- Песочница пишет в `/srv/hermit/workspace`. Пока ядро читает поведение только
+- Песочница пишет в `/opt/hermit/workspace`. Пока ядро читает поведение только
   из `behavior/`, это безопасно. Как только появится автозагрузка скиллов из
   рабочей папки, проверка поведения обходится тривиально — так делать нельзя.
 - Провал события не ретраится автоматически: повторный `bash` может повторить
