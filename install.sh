@@ -27,11 +27,26 @@ if [ -z "${BASH_SOURCE[0]:-}" ]; then
     SRC="${HERMIT_SRC:-https://codeload.github.com/nemiwastaken/Hermit/tar.gz/$REF}"
     command -v curl >/dev/null || { echo "error: curl is required" >&2; exit 1; }
     command -v tar >/dev/null || { echo "error: tar is required" >&2; exit 1; }
+    # A branch name says nothing about what is installed, so resolve it once
+    # here: the install records the commit, and the next run compares against it.
+    COMMIT=""
+    if [ -z "${HERMIT_SRC:-}" ]; then
+        COMMIT="$(git ls-remote https://github.com/nemiwastaken/Hermit "$REF" 2>/dev/null |
+            awk 'NR == 1 { print $1 }' || true)"
+    fi
+    if [ -z "$COMMIT" ]; then
+        # No git or a mirror: accept HERMIT_REF only if it already looks like a
+        # commit. A branch name must never be recorded as the installed version.
+        case "$REF" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) COMMIT="$REF" ;;
+        esac
+    fi
     TMP="$(mktemp -d)"
     trap 'rm -rf "$TMP"' EXIT
     echo "== downloading Hermit ($REF)"
     curl -fsSL "$SRC" | tar -xz -C "$TMP" --strip-components=1
-    HERMIT_PIPED=1 HERMIT_GIT_REV="$REF" bash "$TMP/install.sh" "$@"
+    HERMIT_PIPED=1 HERMIT_GIT_REV="$REF" HERMIT_COMMIT="$COMMIT" \
+        bash "$TMP/install.sh" "$@"
     exit $?
 fi
 
@@ -79,19 +94,38 @@ RUN_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 as_user() { runuser -u "$RUN_USER" -- env HOME="$RUN_HOME" "$@"; }
 
 say "Hermit -> $PREFIX (sandbox runs as $RUN_USER:$RUN_GID)"
-if [ -n "${HERMIT_GIT_REV:-}" ]; then
-    GIT_REV="$HERMIT_GIT_REV"
+if [ -n "${HERMIT_PIPED:-}" ]; then
+    GIT_REV="${HERMIT_COMMIT:-${HERMIT_GIT_REV:-unknown}}"
+    INSTALL_ID="${HERMIT_COMMIT:-}"
 else
-    GIT_REV="$(git -C "$REPO" -c safe.directory="$REPO" describe --always --dirty 2>/dev/null || echo unknown)"
+    gitc() { git -C "$REPO" -c safe.directory="$REPO" "$@"; }
+    GIT_REV="$(gitc describe --always --dirty 2>/dev/null || echo unknown)"
+    # Uncommitted edits have no identity: build them, but never record them as
+    # the installed version, or the next run would skip a needed rebuild.
+    INSTALL_ID="$(gitc rev-parse HEAD 2>/dev/null || true)"
+    [ -z "$(gitc status --porcelain 2>/dev/null)" ] || INSTALL_ID=""
+fi
+# A full commit is noise in the output; describe --always already gives 7 chars.
+[ "${#GIT_REV}" -eq 40 ] && GIT_REV="${GIT_REV:0:7}"
+INSTALLED="$(cat "$PREFIX/version" 2>/dev/null || true)"
+UNCHANGED=0
+if [ -n "$INSTALL_ID" ] && [ "$INSTALL_ID" = "$INSTALLED" ] && [ -x "$PREFIX/bin/hermit" ]; then
+    UNCHANGED=1
 fi
 echo "   source: $GIT_REV"
 if [ -x "$PREFIX/bin/hermit" ]; then
-    OLD_VERSION="$("$PREFIX/bin/hermit" --version 2>/dev/null || true)"
-    echo "   updating existing install${OLD_VERSION:+ ($OLD_VERSION)}"
+    if [ -n "$INSTALLED" ]; then
+        echo "   installed: ${INSTALLED:0:7}"
+    else
+        echo "   installed: $("$PREFIX/bin/hermit" --version 2>/dev/null || echo unknown), no commit recorded"
+    fi
 fi
 
 # ---------------------------------------------------------------- build
-if [ "$SKIP_BUILD" -eq 0 ]; then
+if [ "$SKIP_BUILD" -eq 0 ] && [ "$UNCHANGED" -eq 1 ]; then
+    say "already at $GIT_REV, skipping the build"
+fi
+if [ "$SKIP_BUILD" -eq 0 ] && [ "$UNCHANGED" -eq 0 ]; then
     # Piped install extracts the sources as root into a 700 temp dir; the build
     # runs as the normal user, so hand it over.
     if [ -n "${HERMIT_PIPED:-}" ]; then
@@ -221,6 +255,13 @@ else
     say "installing the core binary"
     install -m 755 "$BIN" "$PREFIX/bin/.hermit.new"
     mv -f "$PREFIX/bin/.hermit.new" "$PREFIX/bin/hermit"
+fi
+# Remember what is running, so the next run knows whether to rebuild. Both
+# paths qualify: a binary just built from this source, or the one the version
+# file already describes. --skip-build with a foreign binary does not.
+if [ -n "$INSTALL_ID" ] &&
+    { [ "$BIN" != "$PREFIX/bin/hermit" ] || [ "$UNCHANGED" -eq 1 ]; }; then
+    printf '%s\n' "$INSTALL_ID" > "$PREFIX/version"
 fi
 
 # ---------------------------------------------------------------- service
