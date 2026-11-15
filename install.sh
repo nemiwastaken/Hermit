@@ -254,7 +254,7 @@ Hermit installed:
   workspace  $WORKSPACE
 
 Next:
-  1. write to your bot: it replies with your chat id
-  2. put that id into TELEGRAM_ALLOWED_CHAT_IDS in $CONF
+  1. write to your bot in a private chat: it replies with your user id
+  2. put that id into TELEGRAM_ALLOWED_USER_IDS in $CONF
   3. systemctl restart hermit
 EOF
