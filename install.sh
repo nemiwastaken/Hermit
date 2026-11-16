@@ -152,7 +152,8 @@ fi
 say "creating directories"
 install -d -m 755 "$PREFIX" "$PREFIX/bin" "$PREFIX/sandbox" "$PREFIX/net"
 install -d -m 700 -o root -g root "$DATA"
-install -d -m 700 -o "$RUN_USER" -g "$RUN_GID" "$RUN_DIR"
+install -d -m 700 -o "$RUN_USER" -g "$RUN_GID" \
+    "$RUN_DIR" "$RUN_DIR/sandbox" "$RUN_DIR/net"
 install -d -m 755 -o "$RUN_USER" -g "$RUN_GID" "$WORKSPACE"
 
 install -m 644 "$REPO/sandbox/server.py" "$REPO/sandbox/Dockerfile" "$PREFIX/sandbox/"
@@ -213,8 +214,8 @@ fi
 # ---------------------------------------------------------------- config
 PATHS=(
     -e "s|^DATABASE_PATH=.*|DATABASE_PATH=$DATA/hermit.db|"
-    -e "s|^SANDBOX_SOCKET=.*|SANDBOX_SOCKET=$RUN_DIR/sandbox.sock|"
-    -e "s|^NET_SOCKET=.*|NET_SOCKET=$RUN_DIR/net.sock|"
+    -e "s|^SANDBOX_SOCKET=.*|SANDBOX_SOCKET=$RUN_DIR/sandbox/sandbox.sock|"
+    -e "s|^NET_SOCKET=.*|NET_SOCKET=$RUN_DIR/net/net.sock|"
     -e "s|^BEHAVIOR_DIR=.*|BEHAVIOR_DIR=$PREFIX/behavior|"
 )
 if [ ! -f "$CONF" ]; then
@@ -257,7 +258,7 @@ else
         echo 'TELEGRAM_ALLOWED_USER_IDS=' >> "$CONF"
     # Configs written before the internet tools existed get the socket path.
     grep -q '^NET_SOCKET=' "$CONF" ||
-        echo "NET_SOCKET=$RUN_DIR/net.sock" >> "$CONF"
+        echo "NET_SOCKET=$RUN_DIR/net/net.sock" >> "$CONF"
 fi
 
 # ---------------------------------------------------------------- sandbox

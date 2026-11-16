@@ -20,6 +20,8 @@ pub struct Event {
     pub kind: String,
     pub payload: String,
     pub attempts: i64,
+    /// Why the last attempt failed; shown by /dlq.
+    pub error: Option<String>,
 }
 
 /// A closed session without its transcript: enough for listing and search.
@@ -87,6 +89,8 @@ pub struct Metric {
 #[derive(Debug, Clone)]
 pub struct MetricStats {
     pub count: i64,
+    /// Rows that actually carry a number; `avg` is unfilled without them.
+    pub count_num: i64,
     pub sum: f64,
     pub avg: f64,
     pub min: Option<f64>,
@@ -130,6 +134,7 @@ impl Db {
         conn.execute_batch(include_str!("../migrations/0005_approvals.sql"))?;
         conn.execute_batch(include_str!("../migrations/0006_usage.sql"))?;
         ensure_schedule_columns(&conn)?;
+        ensure_event_columns(&conn)?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
@@ -155,7 +160,7 @@ impl Db {
             .query_row(
                 "UPDATE events SET state = 'running', attempts = attempts + 1
                  WHERE id = (SELECT id FROM events WHERE state = 'new' ORDER BY id LIMIT 1)
-                 RETURNING id, kind, payload, attempts",
+                 RETURNING id, kind, payload, attempts, error",
                 [],
                 |r| {
                     Ok(Event {
@@ -163,6 +168,7 @@ impl Db {
                         kind: r.get(1)?,
                         payload: r.get(2)?,
                         attempts: r.get(3)?,
+                        error: r.get(4)?,
                     })
                 },
             )
@@ -184,9 +190,10 @@ impl Db {
         conn.execute(
             "UPDATE events SET
                  state = CASE WHEN attempts >= ?2 THEN 'dead' ELSE 'new' END,
-                 dead_at = CASE WHEN attempts >= ?2 THEN ?3 ELSE NULL END
+                 dead_at = CASE WHEN attempts >= ?2 THEN ?3 ELSE NULL END,
+                 error = ?4
              WHERE id = ?1",
-            params![id, MAX_ATTEMPTS, now()],
+            params![id, MAX_ATTEMPTS, now(), err],
         )?;
         eprintln!("event {id} failed: {err}");
         Ok(())
@@ -543,9 +550,9 @@ impl Db {
         since: Option<&str>,
     ) -> Result<MetricStats> {
         let conn = self.lock();
-        let (count, sum, avg, min, max, last_ts) = conn.query_row(
+        let (count, sum, avg, min, max, last_ts, count_num) = conn.query_row(
             "SELECT count(*), coalesce(sum(value_num), 0), coalesce(avg(value_num), 0),
-                    min(value_num), max(value_num), max(ts)
+                    min(value_num), max(value_num), max(ts), count(value_num)
              FROM metrics
              WHERE chat_id = ?1 AND metric_key = ?2 AND (?3 IS NULL OR ts >= ?3)",
             params![chat_id, key, since],
@@ -557,6 +564,7 @@ impl Db {
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             },
         )?;
@@ -572,6 +580,7 @@ impl Db {
         let (last_num, last_text) = last.unwrap_or((None, None));
         Ok(MetricStats {
             count,
+            count_num,
             sum,
             avg,
             min,
@@ -692,7 +701,7 @@ impl Db {
     pub fn dead_events(&self, limit: usize) -> Result<Vec<Event>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, kind, payload, attempts FROM events
+            "SELECT id, kind, payload, attempts, error FROM events
              WHERE state = 'dead' ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
@@ -701,6 +710,7 @@ impl Db {
                 kind: r.get(1)?,
                 payload: r.get(2)?,
                 attempts: r.get(3)?,
+                error: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -708,7 +718,7 @@ impl Db {
 
     pub fn requeue_event(&self, id: i64) -> Result<bool> {
         let n = self.lock().execute(
-            "UPDATE events SET state = 'new', attempts = 0, dead_at = NULL
+            "UPDATE events SET state = 'new', attempts = 0, dead_at = NULL, error = NULL
              WHERE id = ?1 AND state = 'dead'",
             params![id],
         )?;
@@ -754,6 +764,23 @@ impl Db {
             |r| r.get(0),
         )?)
     }
+
+    /// Done events are only history; without this the table grows forever.
+    pub fn purge_done(&self, days: i64) -> Result<usize> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        Ok(self.lock().execute(
+            "DELETE FROM events WHERE state = 'done' AND created_at < ?1",
+            params![cutoff],
+        )?)
+    }
+
+    /// Usage older than a year is only noise in /usage.
+    pub fn purge_usage(&self, days: i64) -> Result<usize> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        Ok(self
+            .lock()
+            .execute("DELETE FROM usage WHERE ts < ?1", params![cutoff])?)
+    }
 }
 
 fn schedule_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule> {
@@ -784,6 +811,19 @@ fn ensure_schedule_columns(conn: &rusqlite::Connection) -> Result<()> {
         if !names.iter().any(|n| n == name) {
             conn.execute_batch(&format!("ALTER TABLE schedules ADD COLUMN {name} {decl}"))?;
         }
+    }
+    Ok(())
+}
+
+/// Same reason as ensure_schedule_columns: migrations run on every open and
+/// ALTER TABLE has no IF NOT EXISTS.
+fn ensure_event_columns(conn: &rusqlite::Connection) -> Result<()> {
+    let names: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('events')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !names.iter().any(|n| n == "error") {
+        conn.execute_batch("ALTER TABLE events ADD COLUMN error TEXT")?;
     }
     Ok(())
 }
@@ -958,7 +998,9 @@ mod tests {
         let ev = db.push_event("message", "{}").unwrap();
         db.claim_event().unwrap();
         db.fail(ev, "boom").unwrap();
-        assert_eq!(db.dead_events(10).unwrap()[0].id, ev);
+        let dead = &db.dead_events(10).unwrap()[0];
+        assert_eq!(dead.id, ev);
+        assert_eq!(dead.error.as_deref(), Some("boom"), "/dlq shows the reason");
         assert!(db.requeue_event(ev).unwrap());
         assert!(db.claim_event().unwrap().is_some());
         assert!(!db.requeue_event(ev).unwrap(), "no longer dead");
@@ -978,6 +1020,24 @@ mod tests {
         assert!((today.cost - 0.03).abs() < 1e-9);
         assert_eq!(db.usage_since(1, 7).unwrap().tokens(), 375);
         assert_eq!(db.usage_days(1, 7).unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn done_events_and_old_usage_are_purged() {
+        let (db, dir) = open("purge-work");
+        let ev = db.push_event("message", "{}").unwrap();
+        db.claim_event().unwrap();
+        db.finish(ev).unwrap();
+        assert_eq!(db.purge_done(0).unwrap(), 1);
+        assert!(db.dead_events(10).unwrap().is_empty());
+
+        db.usage_add(1, "m", 1, 1, 0.0).unwrap();
+        db.lock()
+            .execute("UPDATE usage SET ts = '2020-01-01T00:00:00+00:00'", [])
+            .unwrap();
+        assert_eq!(db.purge_usage(30).unwrap(), 1);
+        assert_eq!(db.usage_today(1).unwrap().calls, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

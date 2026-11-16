@@ -115,8 +115,9 @@ systemd.
 Инструменты появляются у модели с именами `mcp__<сервер>__<инструмент>`.
 `approval: true` требует кнопку на каждый вызов, `allow_private: true` разрешает
 сервер в домашней сети (по умолчанию приватные адреса отбиваются как у
-`web_fetch`). `stdio` не поддерживается. После правки:
-`sudo systemctl restart hermit` и `docker compose -f /opt/hermit/compose.yml restart net`.
+`web_fetch`). `stdio` не поддерживается. После правки запусти
+`docker compose -f /opt/hermit/compose.yml restart net` — бот подхватит новые
+инструменты в течение минуты.
 
 ## Лицензия
 

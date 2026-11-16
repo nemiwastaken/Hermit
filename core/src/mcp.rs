@@ -18,13 +18,14 @@ pub struct McpTool {
 
 /// Ask net for the configured servers and their tools. A broken server is
 /// logged and skipped: one bad config must not stop Hermit from starting.
-pub async fn load(net: &Sandbox) -> Vec<McpTool> {
+/// None means net did not answer; an empty list means "no servers".
+pub async fn load(net: &Sandbox) -> Option<Vec<McpTool>> {
     // One attempt with a short timeout: MCP must not delay the bot's start.
     let value = match net.call_once("mcp-load", "mcp_list", &json!({})).await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("mcp: {e:#}");
-            return Vec::new();
+            return None;
         }
     };
     if value["ok"] != true {
@@ -32,10 +33,10 @@ pub async fn load(net: &Sandbox) -> Vec<McpTool> {
             "mcp: {}",
             value["error"].as_str().unwrap_or("net refused mcp_list")
         );
-        return Vec::new();
+        return None;
     }
 
-    parse(&value)
+    Some(parse(&value))
 }
 
 fn parse(value: &Value) -> Vec<McpTool> {

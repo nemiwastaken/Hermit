@@ -351,13 +351,17 @@ def _mcp_probe(cfg):
 def mcp_list(args):
     global MCP_LIST
     with MCP_LOCK:
-        if MCP_LIST is None:
-            configs = _mcp_config()
-            # One slow server must not hold up the others at startup.
-            with ThreadPoolExecutor(max_workers=max(1, min(4, len(configs)))) as pool:
-                servers = list(pool.map(_mcp_probe, configs))
+        if MCP_LIST is not None:
+            return {"ok": True, "servers": MCP_LIST}
+        configs = _mcp_config()
+        # One slow server must not hold up the others at startup.
+        with ThreadPoolExecutor(max_workers=max(1, min(4, len(configs)))) as pool:
+            servers = list(pool.map(_mcp_probe, configs))
+        # Cache only a fully healthy list: a server that was down gets another
+        # chance on the next refresh instead of staying broken until a restart.
+        if all("error" not in s for s in servers):
             MCP_LIST = servers
-        return {"ok": True, "servers": MCP_LIST}
+        return {"ok": True, "servers": servers}
 
 
 def mcp_call(args):

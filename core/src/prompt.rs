@@ -21,7 +21,8 @@ pub fn system(behavior_dir: &str) -> String {
          - Your profile and skills live in the behavior layer. Change them with update_behavior \
            when the user asks you to change how you work; every change is committed and can be \
            undone with /rollback. They live outside /workspace; the profile is included below.\n\
-         - Durable facts about the user or the setup go to MEMORY.md with memory(add=\"...\"). \
+         - Durable facts about the user or the setup go to MEMORY.md with \
+           memory(action=\"add\", text=\"...\"). \
            When the user asks you to remember something, call memory before replying; saying \
            it is saved without a memory call is a lie. Do not store transient details.\n\
          - Skills are listed below by name and one line. Call skill(name) to read the full \
@@ -81,19 +82,21 @@ pub fn system(behavior_dir: &str) -> String {
     {
         p.push_str(
             "\nMEMORY.md does not exist yet. When the user shares a durable fact, create it \
-             with memory(add=\"...\").\n",
+             with memory(action=\"add\", text=\"...\").\n",
         );
     } else if let Some(days) = memory_age_days(behavior_dir)
         && days >= 7
     {
         p.push_str(&format!(
             "\nMEMORY.md has not been updated in {days} days. If the recent work produced a \
-             durable fact, store it with memory(add=\"...\").\n"
+             durable fact, store it with memory(action=\"add\", text=\"...\").\n"
         ));
     }
 
-    if p.len() > 24_000 {
-        p.truncate(24_000);
+    // The per-file caps above already keep the whole prompt under 24k chars;
+    // this is a last resort and must not cut inside a character.
+    if p.chars().count() > 24_000 {
+        p = p.chars().take(24_000).collect();
     }
     p
 }

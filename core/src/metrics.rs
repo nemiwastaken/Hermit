@@ -94,10 +94,11 @@ pub fn report(db: &Db, chat_id: i64, key: &str, days: i64, template: &str) -> St
     let days = days.clamp(1, 3_650);
     let since = (Utc::now() - Duration::days(days)).to_rfc3339();
     match db.metric_stats(chat_id, key, Some(&since)) {
-        Ok(s) if s.count > 0 => template
+        // Only numeric rows: with text-only notes the average would print 0.0.
+        Ok(s) if s.count_num > 0 => template
             .replace("{avg}", &format!("{:.1}", s.avg))
-            .replace("{count}", &s.count.to_string()),
-        Ok(_) => format!("За {days} дн. записей нет."),
+            .replace("{count}", &s.count_num.to_string()),
+        Ok(_) => format!("За {days} дн. числовых записей нет."),
         Err(e) => format!("Не смог посчитать: {e:#}"),
     }
 }
@@ -209,11 +210,20 @@ mod tests {
             ),
             "Средний вес: 81.0 кг (2 записей)."
         );
-        assert_eq!(report(&db, 1, "pulse", 7, "{avg}"), "За 7 дн. записей нет.");
+        assert_eq!(
+            report(&db, 1, "pulse", 7, "{avg}"),
+            "За 7 дн. числовых записей нет."
+        );
+        // Text-only rows have no average: never print a zero that was not entered.
+        log(&db, 1, &json!({"key": "note", "value_text": "x"}));
+        assert_eq!(
+            report(&db, 1, "note", 7, "{avg}"),
+            "За 7 дн. числовых записей нет."
+        );
         // Another chat never sees these rows.
         assert_eq!(
             report(&db, 2, "weight", 7, "{avg}"),
-            "За 7 дн. записей нет."
+            "За 7 дн. числовых записей нет."
         );
         std::fs::remove_dir_all(&dir).ok();
     }

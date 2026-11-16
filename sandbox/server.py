@@ -382,14 +382,24 @@ def clip(text, name):
     """Return (text_for_model, meta) where meta describes the full log."""
     text = text or ""
     lines = text.splitlines()
-    if len(lines) <= MAX_LINES and len(text) <= MAX_BYTES:
-        return "\n".join(l[:MAX_LINE_CHARS] for l in lines), None
+    # A single 15 KB line is over MAX_LINE_CHARS even if it is one of two lines:
+    # spill it too, or the model silently loses the rest of the line.
+    if (len(lines) <= MAX_LINES and len(text) <= MAX_BYTES
+            and all(len(l) <= MAX_LINE_CHARS for l in lines)):
+        return "\n".join(lines), None
 
     path = _spill(text, name)
-    head = [l[:MAX_LINE_CHARS] for l in lines[:HEAD_LINES]]
-    tail = [l[:MAX_LINE_CHARS] for l in lines[-TAIL_LINES:]]
-    omitted = len(lines) - HEAD_LINES - TAIL_LINES
-    body = "\n".join(head) + f"\n... [{omitted} lines omitted, full output: {path}] ...\n" + "\n".join(tail)
+    if len(lines) > HEAD_LINES + TAIL_LINES:
+        head = [l[:MAX_LINE_CHARS] for l in lines[:HEAD_LINES]]
+        tail = [l[:MAX_LINE_CHARS] for l in lines[-TAIL_LINES:]]
+        omitted = len(lines) - HEAD_LINES - TAIL_LINES
+        body = ("\n".join(head)
+                + f"\n... [{omitted} lines omitted, full output: {path}] ...\n"
+                + "\n".join(tail))
+    else:
+        # Few lines, but long ones: no overlap and a non-negative count.
+        body = "\n".join(l[:MAX_LINE_CHARS] for l in lines[:MAX_LINES])
+        body += f"\n... [full output: {path}] ..."
     return body, {"full_path": path, "lines": len(lines)}
 
 
@@ -401,17 +411,26 @@ def bash(req_id, args):
     timeout = min(max(float(args.get("timeout_ms") or 30_000) / 1000.0, 1.0), 600.0)
 
     try:
-        p = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, errors="replace",
-            timeout=timeout, stdin=subprocess.DEVNULL,
+        p = subprocess.Popen(
+            cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, errors="replace",
+            start_new_session=True,
         )
-        rc, out, err = p.returncode, p.stdout, p.stderr
-    except subprocess.TimeoutExpired as e:
-        out = e.stdout if isinstance(e.stdout, str) else ""
-        err = (e.stderr if isinstance(e.stderr, str) else "") + f"\n[timeout after {timeout:.0f}s]"
-        rc = None
     except FileNotFoundError as e:
         return {"ok": False, "exit": None, "stdout": "", "stderr": str(e), "truncated": None}
+    try:
+        out, err = p.communicate(timeout=timeout)
+        rc = p.returncode
+    except subprocess.TimeoutExpired:
+        # kill the whole group: subprocess.run would kill only the direct child,
+        # leaving `bash -c "sleep 3600"` behind until the container restarts.
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        out, err = p.communicate()
+        err = (err or "") + f"\n[timeout after {timeout:.0f}s]"
+        rc = None
 
     stdout, meta_out = clip(out, f"{req_id}-out")
     stderr, meta_err = clip(err, f"{req_id}-err")
@@ -575,6 +594,18 @@ def selftest():
                   "args": {"code": "import hermit\nprint(hermit.call('read', path='a/b.txt')['content'])"}})
     # No live socket in selftest: the helper must fail cleanly, not hang.
     assert r["ok"] is False and "tool socket" in (r["stderr"] or "").lower(), r
+
+    # A timeout must kill the whole process group, not just the direct child.
+    r = dispatch({"id": "t19", "tool": "bash",
+                  "args": {"cmd": ["bash", "-c", "echo $$; sleep 10"], "timeout_ms": 1000}})
+    assert r["ok"] is False and "timeout" in r["stderr"], r
+    child = int(r["stdout"].split()[0])
+    time.sleep(0.1)
+    try:
+        os.kill(child, 0)
+        raise AssertionError("timed-out bash left a process running")
+    except ProcessLookupError:
+        pass
 
     print("selftest ok")
 

@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, Local, Utc};
@@ -53,8 +54,10 @@ pub struct Agent {
     pub db: Arc<Db>,
     pub flags: Arc<Flags>,
     pub behavior_dir: String,
-    /// Tools discovered from configured MCP servers at startup.
-    pub mcp: Vec<crate::mcp::McpTool>,
+    /// Tools discovered from configured MCP servers. Refreshed in the
+    /// background: at boot net may not be listening yet, and a server can come
+    /// and go while core runs.
+    pub mcp: Arc<RwLock<Vec<crate::mcp::McpTool>>>,
     /// Streaming edits and the typing indicator both need the bot.
     pub tg: Arc<crate::telegram::Tg>,
 }
@@ -246,7 +249,8 @@ impl Agent {
             let tools = if self.flags.safe() {
                 None
             } else {
-                Some(policy::schema(&self.mcp))
+                let mcp = self.mcp.read().unwrap_or_else(|e| e.into_inner());
+                Some(policy::schema(&mcp))
             };
             let reply = self.chat(chat_id, &history, tools.as_ref(), stream).await?;
             if let Some(u) = &reply.usage {
@@ -283,17 +287,26 @@ impl Agent {
                 return Ok((text, None));
             }
 
-            if let Some((risky, reason)) = calls.iter().find_map(|c| {
+            if let Some((_, reason)) = calls.iter().find_map(|c| {
                 policy::approval_reason(&c.name, &c.args)
                     .or_else(|| {
-                        self.mcp
-                            .iter()
+                        let mcp = self.mcp.read().unwrap_or_else(|e| e.into_inner());
+                        mcp.iter()
                             .any(|t| t.name == c.name && t.approval)
                             .then_some("внешний MCP-инструмент")
                     })
                     .map(|r| (c, r))
             }) {
-                let label = clamp(&preview(&risky.args), 300);
+                // Approving runs the whole batch, so show every call, not only
+                // the one that triggered the confirmation.
+                let label = clamp(
+                    &calls
+                        .iter()
+                        .map(|c| preview(&c.args))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    300,
+                );
                 let calls_json: Vec<Value> = calls.iter().map(call_json).collect();
                 let id =
                     self.db
@@ -380,7 +393,11 @@ impl Agent {
     }
 
     async fn run_tool(&self, chat_id: i64, id: &str, name: &str, args: &Value) -> Value {
-        if let Err(e) = policy::check(name, self.flags.safe(), &self.mcp) {
+        let allowed = {
+            let mcp = self.mcp.read().unwrap_or_else(|e| e.into_inner());
+            policy::check(name, self.flags.safe(), &mcp)
+        };
+        if let Err(e) = allowed {
             return json!({"ok": false, "error": format!("{e:#}")});
         }
         if name == "recall" {
@@ -420,10 +437,16 @@ impl Agent {
         if name == "query_metrics" {
             return metrics::query(&self.db, chat_id, args);
         }
-        if let Some(tool) = self.mcp.iter().find(|t| t.name == name) {
+        let mcp_tool = {
+            let mcp = self.mcp.read().unwrap_or_else(|e| e.into_inner());
+            mcp.iter()
+                .find(|t| t.name == name)
+                .map(|t| (t.server.clone(), t.tool.clone()))
+        };
+        if let Some((server, tool)) = mcp_tool {
             let call = json!({
-                "server": tool.server,
-                "tool": tool.tool,
+                "server": server,
+                "tool": tool,
                 "arguments": args,
             });
             // A retried MCP call may run twice: no automatic retry.
@@ -442,7 +465,7 @@ impl Agent {
         // must not make core run them a second time.
         let once = matches!(
             name,
-            "write" | "edit" | "patch" | "process_manage" | "execute_code"
+            "bash" | "write" | "edit" | "patch" | "process_manage" | "execute_code"
         );
         let result = if once {
             sandbox.call_once(id, name, args).await
@@ -656,18 +679,32 @@ impl Agent {
         tools: Option<&Value>,
         stream: Option<&crate::telegram::Streamer>,
     ) -> Result<crate::llm::Reply> {
-        let reply = match stream {
-            Some(sink) => match self.llm.chat_stream(messages, tools, sink).await {
-                Ok(reply) => reply,
-                // Nothing was shown yet: the provider may not support
-                // streaming or stream_options, so make one normal call.
-                Err(e) if !sink.started() => {
-                    eprintln!("stream failed, falling back to one call: {e:#}");
-                    self.llm.chat(messages, tools).await?
+        // A rate limit or a provider hiccup on the very first call is safe to
+        // retry: no tool has run yet and nothing is shown to the user.
+        let mut attempt = 0u32;
+        let reply = loop {
+            let result = match stream {
+                Some(sink) => match self.llm.chat_stream(messages, tools, sink).await {
+                    Ok(reply) => Ok(reply),
+                    // Nothing was shown yet: the provider may not support
+                    // streaming or stream_options, so make one normal call.
+                    Err(e) if !sink.started() => {
+                        eprintln!("stream failed, falling back to one call: {e:#}");
+                        self.llm.chat(messages, tools).await
+                    }
+                    Err(e) => Err(e),
+                },
+                None => self.llm.chat(messages, tools).await,
+            };
+            match result {
+                Err(e) if attempt < 2 && transient(&e) && !stream.is_some_and(|s| s.started()) => {
+                    attempt += 1;
+                    let wait = 1 << attempt;
+                    eprintln!("llm transient failure, retry {attempt} in {wait}s: {e:#}");
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
                 }
-                Err(e) => return Err(e),
-            },
-            None => self.llm.chat(messages, tools).await?,
+                other => break other?,
+            }
         };
         if let Some(usage) = &reply.usage {
             let prompt = usage["prompt_tokens"].as_i64().unwrap_or(0);
@@ -735,6 +772,21 @@ impl Agent {
         self.db.kv_del(&recap_key(chat_id))?;
         self.db.kv_del(&recap_id_key(chat_id))
     }
+}
+
+/// A failure worth one more try: rate limit, provider hiccup or timeout.
+fn transient(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}");
+    [
+        "HTTP 429",
+        "HTTP 500",
+        "HTTP 502",
+        "HTTP 503",
+        "HTTP 504",
+        "timed out",
+    ]
+    .iter()
+    .any(|p| msg.contains(p))
 }
 
 fn with_note(answer: String, note: Option<String>) -> String {
@@ -1057,6 +1109,16 @@ mod tests {
             final_answer: final_answer.into(),
             updated_at: "2026-11-14T22:15:00+00:00".into(),
         }
+    }
+
+    #[test]
+    fn only_provider_hiccups_are_retried() {
+        assert!(transient(&anyhow::anyhow!("LLM HTTP 429: slow down")));
+        assert!(transient(&anyhow::anyhow!(
+            "calling the LLM: operation timed out"
+        )));
+        assert!(!transient(&anyhow::anyhow!("LLM HTTP 401: bad key")));
+        assert!(!transient(&anyhow::anyhow!("LLM returned non-JSON")));
     }
 
     #[test]

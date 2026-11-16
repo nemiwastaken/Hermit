@@ -52,6 +52,9 @@ pub fn update(dir: &str, path: &str, content: &str, note: Option<&str>) -> Resul
                 "commit",
                 "-m",
                 &msg,
+                // commit --only: never sweep up what the user staged themselves
+                "--",
+                path,
             ],
         )
     });

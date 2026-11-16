@@ -12,7 +12,7 @@ mod sandbox;
 mod sched;
 mod telegram;
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -33,8 +33,8 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let safe_mode = std::env::args().any(|a| a == "--safe-mode");
     let db_path = env_or("DATABASE_PATH", "./data/hermit.db");
-    let socket = env_or("SANDBOX_SOCKET", "/opt/hermit/run/sandbox.sock");
-    let net_socket = env_or("NET_SOCKET", "/opt/hermit/run/net.sock");
+    let socket = env_or("SANDBOX_SOCKET", "/opt/hermit/run/sandbox/sandbox.sock");
+    let net_socket = env_or("NET_SOCKET", "/opt/hermit/run/net/net.sock");
     let behavior_dir = env_or("BEHAVIOR_DIR", "./behavior");
 
     let db = Db::open(&db_path)?;
@@ -45,16 +45,17 @@ async fn main() -> Result<()> {
     let flags = Arc::new(Flags::new(safe_mode));
     let tg = Arc::new(Tg::from_env()?);
     let net = Sandbox::with_timeout(&net_socket, 60);
-    // MCP discovery runs before Telegram polling; 15 seconds is enough for a
-    // container that is already up and does not hold the bot hostage at boot.
+    // MCP discovery runs before Telegram polling with a short timeout so a
+    // slow server cannot hold the bot hostage at boot.
     let mcp_net = Sandbox::with_timeout(&net_socket, 15);
-    let mcp = mcp::load(&mcp_net).await;
-    eprintln!("mcp: {} tool(s)", mcp.len());
+    let initial = mcp::load(&mcp_net).await.unwrap_or_default();
+    eprintln!("mcp: {} tool(s)", initial.len());
+    let mcp = Arc::new(RwLock::new(initial));
     let agent = Arc::new(Agent {
         llm: llm::Llm::from_env()?,
         tools: Sandbox::new(&socket),
         net,
-        mcp,
+        mcp: mcp.clone(),
         db: db.clone(),
         flags: flags.clone(),
         behavior_dir,
@@ -66,6 +67,12 @@ async fn main() -> Result<()> {
         flags.safe()
     );
 
+    // At boot net may not be listening yet, and `compose restart net` replaces
+    // its list; without this the tools would stay missing or stale forever.
+    tokio::spawn(refresh_mcp(
+        mcp,
+        Sandbox::with_timeout(net_socket.clone(), 60),
+    ));
     let poller = tokio::spawn({
         let tg = tg.clone();
         let db = db.clone();
@@ -96,6 +103,13 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
                 Ok(0) => {}
                 Ok(n) => eprintln!("purged {n} stale approval(s)"),
                 Err(e) => eprintln!("approval_purge: {e:#}"),
+            }
+            for (label, result) in [("event", db.purge_done(30)), ("usage", db.purge_usage(365))] {
+                match result {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("purged {n} old {label} row(s)"),
+                    Err(e) => eprintln!("purge {label}: {e:#}"),
+                }
             }
             next_purge = Instant::now() + Duration::from_secs(3600);
         }
@@ -154,7 +168,8 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
                 None,
             )),
             // The reply to a fixed question is parsed before the model sees it.
-            "telegram" => match sched::answer(&db, chat_id, &text) {
+            // telegram.rs pushes this kind; "telegram" was an old name.
+            "message" => match sched::answer(&db, chat_id, &text) {
                 Some(answer) => Ok((answer, None)),
                 None => usual(&agent, &flags, &db, &tg, chat_id, &text, ev.id).await,
             },
@@ -165,23 +180,21 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
         match outcome {
             Ok((answer, approval)) => {
                 // An empty answer means the streamer already delivered it.
-                let sent = if answer.is_empty() {
-                    Ok(())
-                } else {
-                    match approval {
-                        Some(id) => tg.send_approval(chat_id, &answer, id).await,
-                        None => tg.send(chat_id, &answer).await,
+                if !answer.is_empty()
+                    && let Err(e) = send_with_retry(&tg, chat_id, &answer, approval).await
+                {
+                    // The run succeeded but nothing reached the chat. Park it
+                    // so /dlq shows it instead of finishing as if delivered.
+                    eprintln!("reply to {chat_id}: {e:#}");
+                    if let Err(e) = db.fail(ev.id, &format!("send: {e:#}")) {
+                        eprintln!("fail event {}: {e:#}", ev.id);
                     }
-                };
-                match sent {
-                    Ok(()) => {
-                        if let Some(key) = ask_after
-                            && let Err(e) = sched::set_pending(&db, chat_id, &key)
-                        {
-                            eprintln!("set ask: {e:#}");
-                        }
-                    }
-                    Err(e) => eprintln!("reply to {chat_id}: {e:#}"),
+                    continue;
+                }
+                if let Some(key) = ask_after
+                    && let Err(e) = sched::set_pending(&db, chat_id, &key)
+                {
+                    eprintln!("set ask: {e:#}");
                 }
                 if let Err(e) = db.finish(ev.id) {
                     eprintln!("finish event {}: {e:#}", ev.id);
@@ -194,6 +207,36 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
                     eprintln!("fail event {}: {e:#}", ev.id);
                 }
             }
+        }
+    }
+}
+
+/// One send with two retries: a short 429 must not lose a ready answer.
+async fn send_with_retry(tg: &Tg, chat_id: i64, text: &str, approval: Option<i64>) -> Result<()> {
+    let mut attempt = 0u64;
+    loop {
+        let result = match approval {
+            Some(id) => tg.send_approval(chat_id, text, id).await,
+            None => tg.send(chat_id, text).await,
+        };
+        match result {
+            Err(e) if attempt < 2 => {
+                attempt += 1;
+                eprintln!("send retry {attempt}: {e:#}");
+                tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Keep the MCP tool list current: net may come up after core, and a config
+/// change only takes effect after `compose restart net`.
+async fn refresh_mcp(mcp: Arc<RwLock<Vec<mcp::McpTool>>>, net: Sandbox) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        if let Some(tools) = mcp::load(&net).await {
+            *mcp.write().unwrap_or_else(|e| e.into_inner()) = tools;
         }
     }
 }

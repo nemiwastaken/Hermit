@@ -225,6 +225,24 @@ class Mcp(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["servers"], [])
 
+    def test_a_broken_server_is_probed_again_and_a_healthy_list_is_cached(self):
+        server.MCP_LIST = None
+        cfg = [{"name": "demo", "url": "http://x/", "headers": {},
+                "approval": False, "allow_private": False}]
+        broken = {"name": "demo", "approval": False, "tools": [], "error": "down"}
+        with mock.patch.object(server, "_mcp_config", return_value=cfg), \
+                mock.patch.object(server, "_mcp_probe", return_value=broken) as probe:
+            server.mcp_list({})
+            server.mcp_list({})
+        self.assertEqual(probe.call_count, 2, "a broken server must not be cached")
+
+        healthy = {"name": "demo", "approval": False, "tools": []}
+        with mock.patch.object(server, "_mcp_config", return_value=cfg), \
+                mock.patch.object(server, "_mcp_probe", return_value=healthy) as probe:
+            server.mcp_list({})
+            server.mcp_list({})
+        self.assertEqual(probe.call_count, 1, "a healthy list is cached")
+
     def test_full_handshake_over_local_http(self):
         class Handler(http.server.BaseHTTPRequestHandler):
             session = None

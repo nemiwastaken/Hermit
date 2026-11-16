@@ -10,14 +10,20 @@ services:
     environment:
       HERMIT_WORKSPACE: /workspace
     volumes:
-      - ${HERMIT_RUN_DIR:-./.dev/run}:/run/hermit
+      # Own directory: if both sockets shared one mount, bash could reach net.sock
+      # and use the internet the sandbox is supposed to lack. install.sh creates
+      # the two subdirectories; in dev run: mkdir -p .dev/run/sandbox .dev/run/net
+      - ${HERMIT_RUN_DIR:-./.dev/run}/sandbox:/run/hermit
       - ${HERMIT_WORKSPACE:-./.dev/workspace}:/workspace
-      - ${HERMIT_BEHAVIOR:-./.dev/behavior}:/behavior:ro
     read_only: true
     tmpfs:
       - /tmp:size=64m
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    # Untrusted code runs here: without limits a fork bomb or a leak hurts the host.
+    mem_limit: 1g
+    pids_limit: 256
+    cpus: 1.0
 
   net:
     build: ./net
@@ -29,7 +35,7 @@ services:
     environment:
       HERMIT_MCP_FILE: /etc/hermit/mcp.json
     volumes:
-      - ${HERMIT_RUN_DIR:-./.dev/run}:/run/hermit
+      - ${HERMIT_RUN_DIR:-./.dev/run}/net:/run/hermit
       # Remote MCP servers are configured here; secrets stay on the host.
       - ${HERMIT_MCP_CONFIG:-./.dev/mcp.json}:/etc/hermit/mcp.json:ro
     read_only: true

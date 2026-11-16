@@ -202,6 +202,9 @@ fn dlq(db: &Db) -> String {
                     .and_then(|v| v["text"].as_str().map(str::to_string))
                     .unwrap_or_else(|| e.payload.clone());
                 out.push_str(&format!("#{} {} — {}\n", e.id, e.kind, short(&text, 60)));
+                if let Some(err) = &e.error {
+                    out.push_str(&format!("   ошибка: {}\n", short(err, 120)));
+                }
             }
             out.push_str("\n/retry <id> — вернуть в очередь.");
             out

@@ -21,7 +21,9 @@ ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
 NoNewPrivileges=yes
-ReadWritePaths=@PREFIX@/data @PREFIX@/run
+# behavior/ is a git repo the agent commits to; without it memory and
+# update_behavior fail with a read-only file system.
+ReadWritePaths=@PREFIX@/data @PREFIX@/run @PREFIX@/behavior
 
 [Install]
 WantedBy=multi-user.target

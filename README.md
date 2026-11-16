@@ -115,9 +115,9 @@ Answered immediately, no model call:
 The tools appear to the model as `mcp__<server>__<tool>`. `approval: true`
 requires a button for every call, `allow_private: true` allows a server on the
 home network (private addresses are blocked by default, as in `web_fetch`).
-`stdio` is not supported. After editing:
-`sudo systemctl restart hermit` and
-`docker compose -f /opt/hermit/compose.yml restart net`.
+`stdio` is not supported. After editing, run
+`docker compose -f /opt/hermit/compose.yml restart net`; the bot picks up the
+new tools within a minute.
 
 ## License
 

@@ -29,10 +29,11 @@ fn esc_attr(s: &str) -> String {
 
 fn safe_link(url: &str) -> Option<&str> {
     let url = url.trim();
-    if LINK_SCHEMES
-        .iter()
-        .any(|s| url.len() > s.len() && url[..s.len()].eq_ignore_ascii_case(s))
-    {
+    // Compare bytes: url[..len] panics when the cut lands inside a Cyrillic
+    // character, which a relative link like `[отчёт](отчёты/2026.md)` hits.
+    if LINK_SCHEMES.iter().any(|s| {
+        url.len() > s.len() && url.as_bytes()[..s.len()].eq_ignore_ascii_case(s.as_bytes())
+    }) {
         Some(url)
     } else {
         None
@@ -273,6 +274,8 @@ mod tests {
             "<a href=\"https://example.com/a?b=1&amp;c=2\">сайт</a>"
         );
         assert_eq!(to_html("[файл](file:///etc/passwd)"), "файл");
+        // A non-ASCII target must not panic on a byte slice.
+        assert_eq!(to_html("[отчёт](отчёты/2026.md)"), "отчёт");
         assert_eq!(
             to_html("[tg](tg://resolve?domain=hermit)"),
             "<a href=\"tg://resolve?domain=hermit\">tg</a>"

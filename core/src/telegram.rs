@@ -348,7 +348,53 @@ fn parse_callback(data: &str) -> Option<(bool, i64)> {
     Some((approve, id.parse().ok()?))
 }
 
-/// Telegram caps a message at 4096 chars; split on newlines, hard-cut long lines.
+/// Telegram caps a message at 4096 chars; split on newlines, and split a line
+/// longer than a whole message instead of dropping its tail.
+pub fn chunks(text: &str, max: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    // A piece plus its newline must fit, so a piece is at most max - 1 chars.
+    let piece_max = max.saturating_sub(1).max(1);
+    for line in text.lines() {
+        if line.is_empty() {
+            cur.push('\n');
+            continue;
+        }
+        for piece in split_line(line, piece_max) {
+            if !cur.is_empty() && cur.chars().count() + piece.chars().count() + 1 > max {
+                out.push(std::mem::take(&mut cur));
+            }
+            cur.push_str(piece);
+            cur.push('\n');
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push("(пусто)".into());
+    }
+    out
+}
+
+/// Borrowed byte slices of at most `max` chars, cut on char boundaries.
+fn split_line(line: &str, max: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut len = 0;
+    for (i, _) in line.char_indices() {
+        if len == max {
+            out.push(&line[start..i]);
+            start = i;
+            len = 0;
+        }
+        len += 1;
+    }
+    out.push(&line[start..]);
+    out
+}
+
+/// A streamed answer: one Telegram message, edited at most every two seconds.
 pub struct Streamer {
     tg: Arc<Tg>,
     chat_id: i64,
@@ -420,12 +466,10 @@ impl Streamer {
     /// Deliver the final text. False means "nothing was shown, send it as a
     /// normal message"; true means the streamer owns delivery.
     pub async fn finish(&self, text: &str) -> Result<bool> {
-        // The first send may still be in flight; without this wait finish sees
-        // no message id and main would post the answer a second time.
-        for _ in 0..40 {
-            if !self.state.lock().unwrap().pending {
-                break;
-            }
+        // The first send or the last edit may still be in flight. Wait for it:
+        // a late edit would overwrite the final text, and until it lands finish
+        // does not even know the message id. The HTTP timeout bounds the wait.
+        while self.state.lock().unwrap().pending {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let id = {
@@ -458,30 +502,6 @@ impl crate::llm::Sink for Streamer {
     fn delta(&self, text: &str) {
         Streamer::delta(self, text);
     }
-}
-
-pub fn chunks(text: &str, max: usize) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for line in text.lines() {
-        let mut line: String = line.chars().take(max).collect();
-        if line.is_empty() {
-            line.push('\n');
-            continue;
-        }
-        if !cur.is_empty() && cur.chars().count() + line.chars().count() + 1 > max {
-            out.push(std::mem::take(&mut cur));
-        }
-        cur.push_str(&line);
-        cur.push('\n');
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur);
-    }
-    if out.is_empty() {
-        out.push("(пусто)".into());
-    }
-    out
 }
 
 #[cfg(test)]
@@ -535,5 +555,18 @@ mod tests {
         }
         let joined: String = parts.concat();
         assert_eq!(joined.matches("line ").count(), 500);
+    }
+
+    #[test]
+    fn a_line_longer_than_a_chunk_is_split_not_dropped() {
+        let parts = chunks(&"x".repeat(9000), 100);
+        assert!(parts.iter().all(|p| p.chars().count() <= 100));
+        let kept: usize = parts.iter().map(|p| p.matches('x').count()).sum();
+        assert_eq!(kept, 9000);
+    }
+
+    #[test]
+    fn blank_lines_are_kept() {
+        assert_eq!(chunks("a\n\nb", 100).concat(), "a\n\nb\n");
     }
 }
