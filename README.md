@@ -121,4 +121,4 @@ new tools within a minute.
 
 ## License
 
-See `LICENSE`.
+[MIT](LICENSE)

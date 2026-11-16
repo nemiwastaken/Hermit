@@ -121,4 +121,4 @@ systemd.
 
 ## Лицензия
 
-См. `LICENSE`.
+[MIT](LICENSE)
