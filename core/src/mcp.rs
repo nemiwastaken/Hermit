@@ -72,10 +72,12 @@ fn parse(value: &Value, source: Source) -> Vec<McpTool> {
             } else {
                 description
             };
-            if source == Source::Browser
-                && matches!(tool_name, "browser_screenshot" | "browser_pdf")
-            {
-                description.push_str(" Sends the capture as a file to the current Telegram chat.");
+            if source == Source::Browser {
+                description.insert_str(0, "Obscura browser. ");
+                if matches!(tool_name, "browser_screenshot" | "browser_pdf") {
+                    description
+                        .push_str(" Sends the capture as a file to the current Telegram chat.");
+                }
             }
             let parameters = tool["inputSchema"]
                 .as_object()
@@ -142,5 +144,17 @@ mod tests {
         );
         assert_eq!(wire_name("my.server", "a b"), "mcp__my_server__a_b");
         assert!(wire_name(&"x".repeat(80), "y").len() <= 64);
+    }
+
+    #[test]
+    fn built_in_browser_tools_identify_their_backend() {
+        let value = json!({"servers": [{"name": "local", "tools": [
+            {"name": "browser_navigate", "description": "Open a page"}
+        ]}]});
+        assert_eq!(
+            parse(&value, Source::Browser)[0].description,
+            "Obscura browser. Open a page"
+        );
+        assert_eq!(parse(&value, Source::Remote)[0].description, "Open a page");
     }
 }
