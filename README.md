@@ -75,6 +75,11 @@ preview. Audio, video and other binary files are available to tools as
 originals. With a vision-capable Chat Completions model, set `LLM_VISION=1` in
 `hermit.env` to send eligible images up to 5 MB to the model directly.
 
+Ask Hermit to send an existing file or a generated report. It sends the file
+as a document to the current Telegram chat using `send_file`, with a 50 MB
+limit per file. The path can be in `/workspace`, `/attachments`, or
+`/host` when host access is enabled.
+
 For local development, create the bind mount directory with
 `mkdir -p .dev/attachments` before starting Compose. If you customize
 `HERMIT_ATTACHMENTS_DIR`, use the same host path for the core and Compose.

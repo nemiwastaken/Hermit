@@ -9,6 +9,7 @@ use crate::attachments::{File, MAX_BYTES};
 use crate::events::Db;
 
 const TG_TEXT_LIMIT: usize = 4000;
+pub const MAX_DOCUMENT_BYTES: usize = 50 * 1024 * 1024;
 
 pub struct Tg {
     http: reqwest::Client,
@@ -291,13 +292,18 @@ impl Tg {
     pub async fn send_document(
         &self,
         chat_id: i64,
-        filename: &'static str,
+        filename: &str,
         mime: &str,
         bytes: Vec<u8>,
     ) -> Result<()> {
         use reqwest::multipart::{Form, Part};
 
-        let file = Part::bytes(bytes).file_name(filename).mime_str(mime)?;
+        if bytes.len() > MAX_DOCUMENT_BYTES {
+            bail!("file exceeds the 50 MB Telegram upload limit");
+        }
+        let file = Part::bytes(bytes)
+            .file_name(filename.to_owned())
+            .mime_str(mime)?;
         let form = Form::new()
             .text("chat_id", chat_id.to_string())
             .part("document", file);

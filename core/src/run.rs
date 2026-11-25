@@ -430,6 +430,23 @@ impl Agent {
         if name == "recall" {
             return recall(&self.db, chat_id, args);
         }
+        if name == "send_file" {
+            let Some(path) = args["path"].as_str() else {
+                return json!({"ok": false, "error": "path must be a string"});
+            };
+            let result = async {
+                let (filename, bytes) = self.tools.export_file(id, path).await?;
+                self.tg
+                    .send_document(chat_id, &filename, "application/octet-stream", bytes)
+                    .await?;
+                Ok::<_, anyhow::Error>(filename)
+            }
+            .await;
+            return match result {
+                Ok(filename) => json!({"ok": true, "sent_to_telegram": filename}),
+                Err(error) => json!({"ok": false, "error": format!("{error:#}")}),
+            };
+        }
         if name == "manage_schedule" {
             return sched::handle(&self.db, chat_id, args);
         }

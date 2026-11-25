@@ -5,6 +5,8 @@ The core sends one JSON object per line, gets one JSON object back:
     -> {"id":"e42/7","tool":"bash","args":{"cmd":["ls","-la"],"cwd":"/workspace"}}
     <- {"id":"e42/7","ok":true,"exit":0,"stdout":"...","stderr":"","truncated":null}
 
+export_file sends a JSON header followed by exactly size bytes, then closes.
+
 No shell string ever crosses the socket: `cmd` is argv. A model that wants a
 shell pipe has to ask for it explicitly (["bash","-lc","..."]), and it happens
 inside this container, not in the core.
@@ -32,6 +34,8 @@ TAIL_LINES = 100
 MAX_LINE_CHARS = 2000    # one minified file must not eat the context
 MAX_BYTES = 20_000       # soft cap before spilling to a file
 MAX_READ_BYTES = 8 * 1024 * 1024
+MAX_EXPORT_BYTES = 50 * 1024 * 1024
+ATTACHMENTS = "/attachments"
 MAX_MATCHES = 100
 MAX_GLOB = 500
 MAX_PROCS = 8
@@ -47,7 +51,7 @@ def _spill(text, name):
     return path
 
 
-def _path(value, must_exist=False):
+def _path(value, must_exist=False, include_attachments=False):
     """Resolve under /workspace. A path that escapes through .. or a symlink
     is rejected, not followed."""
     if not isinstance(value, str) or not value.strip():
@@ -55,6 +59,8 @@ def _path(value, must_exist=False):
     root = os.path.realpath(WORKSPACE)
     p = os.path.realpath(value if os.path.isabs(value) else os.path.join(root, value))
     roots = (root, HOST_ROOT) if HOST_ROOT else (root,)
+    if include_attachments:
+        roots += (ATTACHMENTS,)
     if not any(p == allowed or p.startswith(allowed + os.sep) for allowed in roots):
         raise ValueError(f"{value} is outside the allowed filesystem roots")
     if must_exist and not os.path.exists(p):
@@ -472,6 +478,43 @@ def read_file(req_id, args):
             "lines": len(lines), "offset": offset, "truncated": trunc}
 
 
+def _open_export(value):
+    path = _path(value, include_attachments=True)
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("path must be a regular file")
+        if info.st_size > MAX_EXPORT_BYTES:
+            raise ValueError("file exceeds the 50 MB Telegram upload limit")
+        return os.fdopen(fd, "rb"), os.path.basename(value), info.st_size
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def export_file(conn, req):
+    req_id = req.get("id")
+    args = req.get("args")
+    try:
+        if not isinstance(args, dict):
+            raise ValueError("args must be an object")
+        file, name, size = _open_export(args.get("path"))
+    except (OSError, ValueError) as error:
+        header = {"id": req_id, "ok": False, "error": str(error)}
+        conn.sendall((json.dumps(header) + "\n").encode())
+        return
+    with file:
+        header = {"id": req_id, "ok": True, "filename": name, "size": size}
+        conn.sendall((json.dumps(header) + "\n").encode())
+        while size:
+            chunk = file.read(min(size, 64 * 1024))
+            if not chunk:
+                return
+            conn.sendall(chunk)
+            size -= len(chunk)
+
+
 def dispatch(req):
     req_id, tool, args = req.get("id"), req.get("tool"), req.get("args") or {}
     if not isinstance(args, dict):
@@ -535,6 +578,12 @@ def handle(conn):
             except json.JSONDecodeError:
                 resp = {"id": None, "ok": False, "error": "invalid json"}
             else:
+                if isinstance(req, dict) and req.get("tool") == "export_file":
+                    try:
+                        export_file(conn, req)
+                    except OSError:
+                        pass  # Broken or partial transfer is detected by the caller.
+                    return
                 resp = dispatch(req)
             conn.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode())
 
@@ -613,6 +662,30 @@ def selftest():
         raise AssertionError("timed-out bash left a process running")
     except ProcessLookupError:
         pass
+
+    data = b"\x00artifact\xff\n"
+    with open(os.path.join(WORKSPACE, "отчёт.bin"), "wb") as file:
+        file.write(data)
+    with open(os.path.join(WORKSPACE, "large.bin"), "wb") as file:
+        file.truncate(MAX_EXPORT_BYTES + 1)
+    for path, expected in [
+        ("отчёт.bin", None),
+        ("missing.bin", "No such file"),
+        ("a", "regular file"),
+        ("../escape", "outside"),
+        ("large.bin", "50 MB"),
+    ]:
+        sender, receiver = socket.socketpair()
+        with sender, receiver, receiver.makefile("rb") as response:
+            export_file(sender, {"id": "export-test", "args": {"path": path}})
+            sender.shutdown(socket.SHUT_WR)
+            header = json.loads(response.readline())
+            if expected:
+                assert not header["ok"] and expected in header["error"], header
+                assert not response.read()
+            else:
+                assert header == {"id": "export-test", "ok": True, "filename": path, "size": len(data)}
+                assert response.read() == data
 
     print("selftest ok")
 

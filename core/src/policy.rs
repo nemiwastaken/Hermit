@@ -2,9 +2,10 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 /// The only tools core is allowed to ask for.
-const ALLOWED: [&str; 19] = [
+const ALLOWED: [&str; 20] = [
     "bash",
     "read",
+    "send_file",
     "write",
     "edit",
     "patch",
@@ -26,6 +27,20 @@ const ALLOWED: [&str; 19] = [
 
 pub fn schema(extra: &[crate::mcp::McpTool]) -> Value {
     let mut all = json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "send_file",
+                "description": "Send an existing or newly created file as a Telegram document to the current chat when the user requests it. Supports any file format up to 50 MB.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path relative to /workspace or absolute path in /workspace, /attachments, or /host when enabled"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
         {
             "type": "function",
             "function": {
@@ -477,6 +492,9 @@ mod tests {
         assert!(check("list", false, &[]).is_ok());
         assert!(check("process_manage", false, &[]).is_ok());
         assert!(check("execute_code", false, &[]).is_ok());
+        assert!(check("send_file", false, &[]).is_ok());
+        assert!(check("send_file", true, &[]).is_err());
+        assert!(check("export_file", false, &[]).is_err());
         assert!(check("memory", false, &[]).is_ok());
         assert!(check("skill", false, &[]).is_ok());
         assert!(check("recall", false, &[]).is_ok());
@@ -495,6 +513,7 @@ mod tests {
         let names = schema(&[]).to_string();
         assert!(names.contains("\"memory\"") && names.contains("\"skill\""));
         assert!(names.contains("\"execute_code\""));
+        assert!(names.contains("\"send_file\""));
         let extra = vec![crate::mcp::McpTool {
             source: crate::mcp::Source::Remote,
             name: "mcp__demo__echo".into(),
