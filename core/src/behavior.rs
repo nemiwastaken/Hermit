@@ -185,6 +185,15 @@ pub fn memory(dir: &str) -> Result<String> {
 /// before it touches the filesystem.
 pub fn read_skill(dir: &str, name: &str) -> Result<String> {
     let name = name.trim().trim_end_matches(".md");
+    let builtin = match name {
+        "hermit/web" => Some(include_str!("../behavior/skills/web.md")),
+        "hermit/files" => Some(include_str!("../behavior/skills/files.md")),
+        "hermit/runtime" => Some(include_str!("../behavior/skills/runtime.md")),
+        _ => None,
+    };
+    if let Some(text) = builtin {
+        return Ok(text.trim().to_owned());
+    }
     if name.is_empty() || !skill_path(&format!("skills/{name}.md")) {
         bail!("unknown skill `{name}`");
     }

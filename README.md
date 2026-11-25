@@ -50,8 +50,10 @@ overwritten, and the binary is replaced atomically. Everything lives in
   tabs. The bot sends screenshots and PDFs back to the Telegram chat.
 - **Memory and behavior**: `USER.md` and `MEMORY.md` in git, changed through
   tools with a commit; `/rollback` undoes the last change.
-- **Skills**: the prompt carries only the name and a one-line description, the
-  body is read by `skill(name)` — fewer tokens per turn.
+- **Agent profile and skills**: [HERMIT.md](core/behavior/HERMIT.md) defines
+  the agent and indexes its [built-in guides](core/behavior/skills). Hermit
+  loads guide bodies and custom skills through `skill(name)` when needed.
+  Keep personal preferences in `USER.md` and lasting facts in `MEMORY.md`.
 - **Sessions**: closed dialogs go to the archive; past ones are found by a
   question, `/sessions` or `recall`. Anything older than 30 days is deleted.
 - **Context**: `/compress` replaces the transcript with a summary and the last
