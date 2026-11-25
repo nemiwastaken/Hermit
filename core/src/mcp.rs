@@ -1,9 +1,14 @@
-//! MCP servers are remote HTTP endpoints in the net container. Core only
-//! knows their tool schemas; the call itself never touches core's network.
+//! MCP tools come from remote HTTP servers or the local browser container.
 
 use serde_json::{Value, json};
 
 use crate::sandbox::Sandbox;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Remote,
+    Browser,
+}
 
 #[derive(Debug, Clone)]
 pub struct McpTool {
@@ -12,19 +17,18 @@ pub struct McpTool {
     pub tool: String,
     pub description: String,
     pub parameters: Value,
+    pub source: Source,
     /// The server's config can demand a Telegram confirmation per call.
     pub approval: bool,
 }
 
-/// Ask net for the configured servers and their tools. A broken server is
-/// logged and skipped: one bad config must not stop Hermit from starting.
-/// None means net did not answer; an empty list means "no servers".
-pub async fn load(net: &Sandbox) -> Option<Vec<McpTool>> {
+/// Discover tools. None means the container did not answer successfully.
+pub async fn load(socket: &Sandbox, source: Source) -> Option<Vec<McpTool>> {
     // One attempt with a short timeout: MCP must not delay the bot's start.
-    let value = match net.call_once("mcp-load", "mcp_list", &json!({})).await {
+    let value = match socket.call_once("mcp-load", "mcp_list", &json!({})).await {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("mcp: {e:#}");
+            eprintln!("mcp {source:?}: {e:#}");
             return None;
         }
     };
@@ -36,10 +40,10 @@ pub async fn load(net: &Sandbox) -> Option<Vec<McpTool>> {
         return None;
     }
 
-    Some(parse(&value))
+    Some(parse(&value, source))
 }
 
-fn parse(value: &Value) -> Vec<McpTool> {
+fn parse(value: &Value, source: Source) -> Vec<McpTool> {
     let mut out = Vec::new();
     for server in value["servers"].as_array().cloned().unwrap_or_default() {
         let server_name = server["name"].as_str().unwrap_or("");
@@ -50,7 +54,10 @@ fn parse(value: &Value) -> Vec<McpTool> {
         let approval = server["approval"].as_bool().unwrap_or(false);
         for tool in server["tools"].as_array().cloned().unwrap_or_default() {
             let tool_name = tool["name"].as_str().unwrap_or("");
-            let name = wire_name(server_name, tool_name);
+            let name = match source {
+                Source::Remote => wire_name(server_name, tool_name),
+                Source::Browser => tool_name.to_owned(),
+            };
             if name.is_empty() || tool_name.is_empty() {
                 continue;
             }
@@ -60,11 +67,16 @@ fn parse(value: &Value) -> Vec<McpTool> {
                 .chars()
                 .take(1_000)
                 .collect();
-            let description = if description.trim().is_empty() {
+            let mut description = if description.trim().is_empty() {
                 format!("MCP tool {server_name}/{tool_name}")
             } else {
                 description
             };
+            if source == Source::Browser
+                && matches!(tool_name, "browser_screenshot" | "browser_pdf")
+            {
+                description.push_str(" Sends the capture as a file to the current Telegram chat.");
+            }
             let parameters = tool["inputSchema"]
                 .as_object()
                 .map(|_| tool["inputSchema"].clone())
@@ -75,6 +87,7 @@ fn parse(value: &Value) -> Vec<McpTool> {
                 tool: tool_name.to_string(),
                 description,
                 parameters,
+                source,
                 approval,
             });
         }
@@ -114,7 +127,7 @@ mod tests {
             ]},
             {"name": "broken", "error": "no route", "tools": []}
         ]});
-        let tools = parse(&value);
+        let tools = parse(&value, Source::Remote);
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "mcp__demo__echo");
         assert!(tools[0].approval);

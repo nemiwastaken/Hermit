@@ -1,3 +1,5 @@
+mod coding;
+
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -11,6 +13,7 @@ use crate::events::{
     self, ARCHIVE_DAYS, Archived, Db, recap_id_key, recap_key, summary_key, task_key,
 };
 use crate::llm::Llm;
+use crate::mcp::Source;
 use crate::metrics;
 use crate::policy;
 use crate::prompt;
@@ -49,8 +52,9 @@ const SUMMARY_INPUT_CHARS: usize = 40_000;
 pub struct Agent {
     pub llm: Llm,
     pub tools: Sandbox,
-    /// The net container: web_fetch and web_search, the only route out.
+    /// The net container handles web search, fetch, and remote MCP.
     pub net: Sandbox,
+    pub browser: Sandbox,
     pub db: Arc<Db>,
     pub flags: Arc<Flags>,
     pub behavior_dir: String,
@@ -81,6 +85,7 @@ impl Agent {
         event_id: i64,
         chat_id: i64,
         text: &str,
+        attachment: Option<&crate::attachments::Message>,
     ) -> Result<(String, Option<i64>)> {
         if let Some(id) = self.db.approval_pending(chat_id, APPROVAL_MINUTES)? {
             return Ok((
@@ -110,6 +115,7 @@ impl Agent {
         }
 
         if !history.is_empty()
+            && attachment.is_none()
             && !self
                 .continues(&history, text, updated_at.as_deref(), chat_id)
                 .await
@@ -172,10 +178,12 @@ impl Agent {
             system.push_str(&summary);
         }
         history.insert(0, json!({"role": "system", "content": system}));
-        history.push(json!({"role": "user", "content": text}));
+        let content = attachment.map_or_else(|| text.to_owned(), |attachment| attachment.content());
+        history.push(json!({"role": "user", "content": content}));
 
         let stream = crate::telegram::Streamer::new(self.tg.clone(), chat_id);
-        self.run_loop(event_id, chat_id, history, note, 0, Some(&stream))
+        let image = attachment.and_then(|attachment| attachment.image.as_deref());
+        self.run_loop(event_id, chat_id, history, note, 0, &stream, image)
             .await
     }
 
@@ -231,7 +239,8 @@ impl Agent {
             history,
             None,
             a.step as usize + 1,
-            Some(&stream),
+            &stream,
+            None,
         )
         .await
     }
@@ -243,7 +252,8 @@ impl Agent {
         mut history: Vec<Value>,
         note: Option<String>,
         start_step: usize,
-        stream: Option<&crate::telegram::Streamer>,
+        stream: &crate::telegram::Streamer,
+        image: Option<&str>,
     ) -> Result<(String, Option<i64>)> {
         for step in start_step..MAX_STEPS {
             let tools = if self.flags.safe() {
@@ -252,7 +262,27 @@ impl Agent {
                 let mcp = self.mcp.read().unwrap_or_else(|e| e.into_inner());
                 Some(policy::schema(&mcp))
             };
-            let reply = self.chat(chat_id, &history, tools.as_ref(), stream).await?;
+            let image_message = image
+                .zip(
+                    history
+                        .iter()
+                        .rposition(|message| message["role"] == "user"),
+                )
+                .map(|(url, index)| {
+                    let content = history[index]["content"].take();
+                    history[index]["content"] = json!([
+                        {"type": "text", "text": &content},
+                        {"type": "image_url", "image_url": {"url": url}}
+                    ]);
+                    (index, content)
+                });
+            let reply = self
+                .chat(chat_id, &history, tools.as_ref(), Some(stream))
+                .await;
+            if let Some((index, content)) = image_message {
+                history[index]["content"] = content;
+            }
+            let reply = reply?;
             if let Some(u) = &reply.usage {
                 eprintln!("usage: {u}");
             }
@@ -273,18 +303,15 @@ impl Agent {
                     content
                 };
                 let text = with_note(answer, note);
-                if let Some(s) = stream {
-                    match s.finish(&text).await {
-                        // The streamer already delivered the message.
-                        Ok(true) => return Ok((String::new(), None)),
-                        Ok(false) => return Ok((text, None)),
-                        Err(e) => {
-                            eprintln!("stream finish: {e:#}");
-                            return Ok((text, None));
-                        }
+                return match stream.finish(&text).await {
+                    // The streamer already delivered the message.
+                    Ok(true) => Ok((String::new(), None)),
+                    Ok(false) => Ok((text, None)),
+                    Err(e) => {
+                        eprintln!("stream finish: {e:#}");
+                        Ok((text, None))
                     }
-                }
-                return Ok((text, None));
+                };
             }
 
             if let Some((_, reason)) = calls.iter().find_map(|c| {
@@ -441,9 +468,12 @@ impl Agent {
             let mcp = self.mcp.read().unwrap_or_else(|e| e.into_inner());
             mcp.iter()
                 .find(|t| t.name == name)
-                .map(|t| (t.server.clone(), t.tool.clone()))
+                .map(|t| (t.source, t.server.clone(), t.tool.clone()))
         };
-        if let Some((server, tool)) = mcp_tool {
+        if let Some((source, server, tool)) = mcp_tool {
+            if source == Source::Browser {
+                return self.run_browser(chat_id, id, &tool, args).await;
+            }
             let call = json!({
                 "server": server,
                 "tool": tool,
@@ -455,7 +485,7 @@ impl Agent {
                 Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
             };
         }
-        // The internet lives in its own container, not in the sandbox.
+        // The offline sandbox handles local tools.
         let sandbox = if name == "web_fetch" || name == "web_search" {
             &self.net
         } else {
@@ -475,6 +505,45 @@ impl Agent {
         match result {
             Ok(v) => v,
             Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+        }
+    }
+
+    async fn run_browser(&self, chat_id: i64, id: &str, tool: &str, args: &Value) -> Value {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        let call = json!({ "chat_id": chat_id, "tool": tool, "arguments": args });
+        let result = match self.browser.call_once(id, "mcp_call", &call).await {
+            Ok(result) => result,
+            Err(error) => return json!({"ok": false, "error": format!("{error:#}")}),
+        };
+        if result["ok"] != true || result["is_error"] == true {
+            return result;
+        }
+        let content = &result["content"][0];
+        let (filename, mime, data, signature): (_, _, _, &[u8]) = match tool {
+            "browser_screenshot" => (
+                "screenshot.png",
+                "image/png",
+                &content["data"],
+                b"\x89PNG\r\n\x1a\n",
+            ),
+            "browser_pdf" => (
+                "page.pdf",
+                "application/pdf",
+                &content["resource"]["blob"],
+                b"%PDF-",
+            ),
+            _ => return result,
+        };
+        let Some(bytes) = data.as_str().and_then(|data| STANDARD.decode(data).ok()) else {
+            return json!({"ok": false, "error": "Browser did not return a valid file"});
+        };
+        if !bytes.starts_with(signature) {
+            return json!({"ok": false, "error": "Browser returned an unexpected file format"});
+        }
+        match self.tg.send_document(chat_id, filename, mime, bytes).await {
+            Ok(()) => json!({"ok": true, "sent_to_telegram": filename}),
+            Err(error) => json!({"ok": false, "error": format!("{error:#}")}),
         }
     }
 

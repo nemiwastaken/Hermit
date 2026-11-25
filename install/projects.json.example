@@ -1,0 +1,6 @@
+{
+  "hermit": {
+    "repo": "/workspace/projects/hermit",
+    "check": ["cargo", "test", "--locked", "--offline", "--manifest-path", "core/Cargo.toml"]
+  }
+}

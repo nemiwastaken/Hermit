@@ -24,6 +24,7 @@ import threading
 import time
 
 WORKSPACE = os.environ.get("HERMIT_WORKSPACE", "/workspace")
+HOST_ROOT = "/host" if os.environ.get("HERMIT_HOST_DISK") == "1" else None
 TMP_DIR = os.path.join(WORKSPACE, ".tmp")
 MAX_LINES = 200          # lines returned to the model
 HEAD_LINES = 100
@@ -53,8 +54,9 @@ def _path(value, must_exist=False):
         raise ValueError("path must be a non-empty string")
     root = os.path.realpath(WORKSPACE)
     p = os.path.realpath(value if os.path.isabs(value) else os.path.join(root, value))
-    if p != root and not p.startswith(root + os.sep):
-        raise ValueError(f"{value} is outside /workspace")
+    roots = (root, HOST_ROOT) if HOST_ROOT else (root,)
+    if not any(p == allowed or p.startswith(allowed + os.sep) for allowed in roots):
+        raise ValueError(f"{value} is outside the allowed filesystem roots")
     if must_exist and not os.path.exists(p):
         raise ValueError(f"{value} does not exist")
     return p
@@ -149,7 +151,7 @@ def glob_files(req_id, args):
     for rel in globmod.glob(pattern, root_dir=base, recursive=True, include_hidden=False):
         full = _path(os.path.join(base, rel))
         if os.path.isfile(full):
-            found.append(os.path.relpath(full, WORKSPACE))
+            found.append(display_path(full))
     found.sort()
     return {"ok": True, "matches": found[:limit], "count": len(found),
             "truncated": len(found) > limit}
@@ -191,7 +193,7 @@ def grep_files(req_id, args):
             path = (data.get("path") or {}).get("text") or ""
             line_no = data.get("line_number")
             text = "".join((data.get("lines") or {}).get("text") or "").rstrip("\n")
-            matches.append({"path": os.path.relpath(path, WORKSPACE) if path else "",
+            matches.append({"path": display_path(path) if path else "",
                             "line": line_no, "text": text})
         _, err = proc.communicate(timeout=10)
     except subprocess.TimeoutExpired:
@@ -439,6 +441,11 @@ def bash(req_id, args):
         trunc = {"full_path": (meta_out or meta_err)["full_path"],
                  "lines": (meta_out or {}).get("lines", 0) + (meta_err or {}).get("lines", 0)}
     return {"ok": rc == 0, "exit": rc, "stdout": stdout, "stderr": stderr, "truncated": trunc}
+
+
+def display_path(path):
+    root = os.path.realpath(WORKSPACE)
+    return os.path.relpath(path, root) if path.startswith(root + os.sep) else path
 
 
 def read_file(req_id, args):

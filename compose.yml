@@ -1,10 +1,11 @@
 services:
   sandbox:
-    build: ./sandbox
+    build:
+      context: ./sandbox
+      dockerfile: ${HERMIT_SANDBOX_DOCKERFILE:-Dockerfile}
     container_name: hermit-sandbox
     restart: unless-stopped
-    # No network here, ever: bash must not reach out. The net service below is the
-    # only container with a route to the internet, and it has no workspace.
+    # No network here: internet tools run in containers without the workspace.
     network_mode: none
     user: "${HERMIT_UID:-1000}:${HERMIT_GID:-1000}"
     environment:
@@ -12,9 +13,10 @@ services:
     volumes:
       # Own directory: if both sockets shared one mount, bash could reach net.sock
       # and use the internet the sandbox is supposed to lack. install.sh creates
-      # the two subdirectories; in dev run: mkdir -p .dev/run/sandbox .dev/run/net
+      # the socket directories at install time.
       - ${HERMIT_RUN_DIR:-./.dev/run}/sandbox:/run/hermit
       - ${HERMIT_WORKSPACE:-./.dev/workspace}:/workspace
+      - ${HERMIT_ATTACHMENTS_DIR:-./.dev/attachments}:/attachments:ro
     read_only: true
     tmpfs:
       - /tmp:size=64m
@@ -29,7 +31,7 @@ services:
     build: ./net
     container_name: hermit-net
     restart: unless-stopped
-    # The only way out to the internet. No workspace, no behavior, no database:
+    # Web search, fetch, and remote MCP. No workspace, no behavior, no database:
     # a page can only see what the model sends it.
     user: "${HERMIT_UID:-1000}:${HERMIT_GID:-1000}"
     environment:
@@ -44,3 +46,24 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     mem_limit: 512m
+
+  browser:
+    build: ./browser
+    container_name: hermit-browser
+    restart: unless-stopped
+    init: true
+    user: "${HERMIT_UID:-1000}:${HERMIT_GID:-1000}"
+    networks: [browser-egress]
+    volumes:
+      - ${HERMIT_RUN_DIR:-./.dev/run}/browser:/run/hermit
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+    pids_limit: 128
+    cpus: 2.0
+
+networks:
+  browser-egress:

@@ -2,6 +2,9 @@
 # Hermit installer.
 #
 #   sudo ./install.sh                 # from a clone: install or upgrade
+#   sudo ./install.sh --with-coding   # add the offline Rust environment
+#   sudo ./install.sh --host-disk     # give the sandbox access to /host
+#   sudo ./install.sh --no-host-disk  # remove that access
 #   curl -fsSL <url>/install.sh | sudo bash   # no clone needed
 #   curl -fsSL <url>/install.sh | sudo bash -s -- --no-start
 #
@@ -11,7 +14,8 @@
 # Everything lives under one prefix, PREFIX=/opt/hermit by default:
 #   bin/hermit        binary
 #   sandbox/          Dockerfile + server.py for the sandbox image
-#   net/              Dockerfile + server.py for the one container with internet
+#   net/              Dockerfile + server.py for web search, fetch, and MCP
+#   browser/          Dockerfile + server.py for the Obscura browser
 #   behavior/         your git repo: profile + skills
 #   hermit.env        secrets and paths (mode 600)
 #   data/hermit.db    SQLite database
@@ -61,12 +65,17 @@ UNIT=/etc/systemd/system/hermit.service
 NO_SYSTEMD=0
 NO_START=0
 SKIP_BUILD=0
+CODING=0
+HOST_DISK=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-systemd) NO_SYSTEMD=1 ;;
         --no-start)   NO_START=1 ;;
         --skip-build) SKIP_BUILD=1 ;;
+        --with-coding) CODING=1 ;;
+        --host-disk) HOST_DISK=1 ;;
+        --no-host-disk) HOST_DISK=-1 ;;
         -h|--help)    sed -n '2,/^$/{/^$/q;p}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
     esac
@@ -84,6 +93,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Whose uid the sandbox container runs as, so files in the workspace belong to you.
 RUN_USER="${SUDO_USER:-}"
+if [ -z "$RUN_USER" ] && [ -n "${PKEXEC_UID:-}" ]; then
+    RUN_USER="$(getent passwd "$PKEXEC_UID" | cut -d: -f1)"
+fi
 if [ -z "$RUN_USER" ] || [ "$RUN_USER" = root ]; then
     RUN_USER="$(awk -F: '$3 >= 1000 && $3 < 65534 { print $1; exit }' /etc/passwd)"
 fi
@@ -150,15 +162,40 @@ fi
 
 # ---------------------------------------------------------------- layout
 say "creating directories"
-install -d -m 755 "$PREFIX" "$PREFIX/bin" "$PREFIX/sandbox" "$PREFIX/net"
+install -d -m 755 "$PREFIX" "$PREFIX/bin" "$PREFIX/sandbox" "$PREFIX/net" "$PREFIX/browser"
 install -d -m 700 -o root -g root "$DATA"
+install -d -m 755 -o root -g root "$DATA/attachments"
 install -d -m 700 -o "$RUN_USER" -g "$RUN_GID" \
-    "$RUN_DIR" "$RUN_DIR/sandbox" "$RUN_DIR/net"
+    "$RUN_DIR" "$RUN_DIR/sandbox" "$RUN_DIR/net" "$RUN_DIR/browser"
 install -d -m 755 -o "$RUN_USER" -g "$RUN_GID" "$WORKSPACE"
 
 install -m 644 "$REPO/sandbox/server.py" "$REPO/sandbox/Dockerfile" "$PREFIX/sandbox/"
 install -m 644 "$REPO/net/server.py" "$REPO/net/Dockerfile" "$PREFIX/net/"
+install -m 644 "$REPO/browser/server.py" "$REPO/browser/Dockerfile" "$PREFIX/browser/"
 install -m 644 "$REPO/compose.yml" "$PREFIX/compose.yml"
+
+[ ! -f "$PREFIX/sandbox/Dockerfile.rust" ] || CODING=1
+if [ "$HOST_DISK" -eq 0 ] && [ -f "$PREFIX/compose.host-disk.yml" ]; then
+    HOST_DISK=1
+fi
+if [ "$CODING" -eq 1 ]; then
+    install -d -m 755 "$PREFIX/sandbox/hermit-core"
+    install -d -m 755 -o "$RUN_USER" -g "$RUN_GID" "$WORKSPACE/projects"
+    install -m 644 "$REPO/sandbox/Dockerfile.rust" "$PREFIX/sandbox/"
+    install -m 644 "$REPO/core/Cargo.toml" "$REPO/core/Cargo.lock" "$PREFIX/sandbox/hermit-core/"
+    if [ ! -f "$PREFIX/projects.json" ]; then
+        if [ ! -d "$WORKSPACE/projects/hermit" ]; then
+            [ -d "$REPO/.git" ] || die "--with-coding needs a Git checkout for the initial project"
+            as_user git clone --no-hardlinks -- "$REPO" "$WORKSPACE/projects/hermit"
+        fi
+        install -m 644 "$REPO/install/projects.json.example" "$PREFIX/projects.json"
+    fi
+fi
+if [ "$HOST_DISK" -eq 1 ]; then
+    install -m 644 "$REPO/install/compose.host-disk.yml" "$PREFIX/"
+elif [ "$HOST_DISK" -eq -1 ]; then
+    rm -f -- "$PREFIX/compose.host-disk.yml"
+fi
 
 cat > "$PREFIX/.env" <<EOF
 # Written by install.sh: paths and the uid the sandbox runs as.
@@ -166,9 +203,16 @@ HERMIT_UID=$RUN_UID
 HERMIT_GID=$RUN_GID
 HERMIT_RUN_DIR=$RUN_DIR
 HERMIT_WORKSPACE=$WORKSPACE
+HERMIT_ATTACHMENTS_DIR=$DATA/attachments
 HERMIT_BEHAVIOR=$PREFIX/behavior
 HERMIT_MCP_CONFIG=$PREFIX/mcp.json
 EOF
+if [ "$CODING" -eq 1 ]; then
+    echo 'HERMIT_SANDBOX_DOCKERFILE=Dockerfile.rust' >> "$PREFIX/.env"
+fi
+if [ "$HOST_DISK" -eq 1 ]; then
+    echo 'COMPOSE_FILE=compose.yml:compose.host-disk.yml' >> "$PREFIX/.env"
+fi
 chmod 644 "$PREFIX/.env"
 
 # MCP is opt-in: an empty array means no remote servers. Keep an existing file
@@ -214,8 +258,10 @@ fi
 # ---------------------------------------------------------------- config
 PATHS=(
     -e "s|^DATABASE_PATH=.*|DATABASE_PATH=$DATA/hermit.db|"
+    -e "s|^HERMIT_ATTACHMENTS_DIR=.*|HERMIT_ATTACHMENTS_DIR=$DATA/attachments|"
     -e "s|^SANDBOX_SOCKET=.*|SANDBOX_SOCKET=$RUN_DIR/sandbox/sandbox.sock|"
     -e "s|^NET_SOCKET=.*|NET_SOCKET=$RUN_DIR/net/net.sock|"
+    -e "s|^BROWSER_SOCKET=.*|BROWSER_SOCKET=$RUN_DIR/browser/browser.sock|"
     -e "s|^BEHAVIOR_DIR=.*|BEHAVIOR_DIR=$PREFIX/behavior|"
 )
 if [ ! -f "$CONF" ]; then
@@ -259,11 +305,15 @@ else
     # Configs written before the internet tools existed get the socket path.
     grep -q '^NET_SOCKET=' "$CONF" ||
         echo "NET_SOCKET=$RUN_DIR/net/net.sock" >> "$CONF"
+    grep -q '^BROWSER_SOCKET=' "$CONF" ||
+        echo "BROWSER_SOCKET=$RUN_DIR/browser/browser.sock" >> "$CONF"
+    grep -q '^HERMIT_ATTACHMENTS_DIR=' "$CONF" ||
+        echo "HERMIT_ATTACHMENTS_DIR=$DATA/attachments" >> "$CONF"
 fi
 
 # ---------------------------------------------------------------- sandbox
 if [ "$NO_START" -eq 0 ]; then
-    say "starting the sandbox and net containers"
+    say "starting the sandbox, net, and browser containers"
     need docker "install Docker, or pass --no-start"
     ( cd "$PREFIX" && docker compose up -d --build )
 fi
@@ -310,7 +360,7 @@ cat <<EOF
 Hermit installed:
   version    $VERSION ($GIT_REV)
   binary     $PREFIX/bin/hermit
-  containers $PREFIX/compose.yml -> hermit-sandbox (offline), hermit-net (internet)
+  containers $PREFIX/compose.yml -> hermit-sandbox, hermit-net, hermit-browser
   behavior   $PREFIX/behavior (git repo: profile, MEMORY.md, skills)
   mcp        $PREFIX/mcp.json (remote HTTP servers, [] = off)
   config     $CONF (mode 600)

@@ -16,6 +16,7 @@ pub struct Llm {
     url: String,
     key: String,
     model: String,
+    vision: bool,
     max_tokens: Option<u64>,
     price_in: f64,
     price_out: f64,
@@ -36,6 +37,7 @@ impl Llm {
             bail!("LLM_API_KEY is empty");
         }
         let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-chat".into());
+        let vision = std::env::var("LLM_VISION").as_deref() == Ok("1");
         let max_tokens = std::env::var("LLM_MAX_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok());
@@ -54,6 +56,7 @@ impl Llm {
             url: format!("{}/chat/completions", base.trim_end_matches('/')),
             key,
             model,
+            vision,
             max_tokens,
             price_in: price("LLM_PRICE_IN_PER_M"),
             price_out: price("LLM_PRICE_OUT_PER_M"),
@@ -62,6 +65,10 @@ impl Llm {
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub fn vision(&self) -> bool {
+        self.vision
     }
 
     /// Price of one call from its `usage` object. Unknown tokens cost zero.
@@ -299,6 +306,7 @@ mod tests {
             url: String::new(),
             key: String::new(),
             model: "m".into(),
+            vision: false,
             max_tokens: None,
             price_in: 2.0,
             price_out: 8.0,

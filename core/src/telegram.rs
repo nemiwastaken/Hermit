@@ -2,8 +2,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 
+use crate::attachments::{File, MAX_BYTES};
 use crate::events::Db;
 
 const TG_TEXT_LIMIT: usize = 4000;
@@ -11,6 +13,7 @@ const TG_TEXT_LIMIT: usize = 4000;
 pub struct Tg {
     http: reqwest::Client,
     base: String,
+    file_base: String,
     allowed_chats: Vec<i64>,
     allowed_users: Vec<i64>,
 }
@@ -43,6 +46,7 @@ impl Tg {
         Ok(Self {
             http,
             base: format!("{}/bot{token}", api.trim_end_matches('/')),
+            file_base: format!("{}/file/bot{token}/", api.trim_end_matches('/')),
             allowed_chats,
             allowed_users,
         })
@@ -113,8 +117,11 @@ impl Tg {
         let Some(chat_id) = chat["id"].as_i64() else {
             return Ok(());
         };
-        let Some(text) = msg["text"].as_str() else {
-            return Ok(()); // photos, stickers: nothing to run
+        let attachment = File::from_message(msg);
+        let text = match (&attachment, msg["text"].as_str()) {
+            (Some(_), _) => msg["caption"].as_str().unwrap_or(""),
+            (None, Some(text)) => text,
+            (None, None) => return Ok(()),
         };
         let kind = chat["type"].as_str().unwrap_or("");
         let user_id = msg["from"]["id"].as_i64().unwrap_or(chat_id);
@@ -133,13 +140,91 @@ impl Tg {
             .await?;
             return Ok(());
         }
-        let payload = json!({
+        let mut payload = json!({
             "chat_id": chat_id,
             "text": text,
             "message_id": msg["message_id"].as_i64(),
         });
-        db.push_event("message", &payload.to_string())?;
+        let kind = if let Some(file) = attachment {
+            payload["attachment"] = serde_json::to_value(file)?;
+            "attachment"
+        } else {
+            "message"
+        };
+        db.push_event(kind, &payload.to_string())?;
         Ok(())
+    }
+
+    pub async fn download(&self, file_id: &str) -> Result<Option<Vec<u8>>> {
+        let response: Value = self
+            .http
+            .post(format!("{}/getFile", self.base))
+            .json(&json!({"file_id": file_id}))
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("Telegram getFile")?
+            .json()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("reading Telegram getFile response")?;
+        if response["ok"] != true {
+            if response["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("file is too big"))
+            {
+                return Ok(None);
+            }
+            bail!("Telegram getFile failed (code {})", response["error_code"]);
+        }
+        let file = &response["result"];
+        if file["file_size"]
+            .as_u64()
+            .is_some_and(|size| size > MAX_BYTES as u64)
+        {
+            return Ok(None);
+        }
+        let path = file["file_path"]
+            .as_str()
+            .context("Telegram omitted the file path")?;
+        let mut url = reqwest::Url::parse(&self.file_base)
+            .map_err(|_| anyhow::anyhow!("invalid Telegram download base URL"))?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow::anyhow!("invalid Telegram download base URL"))?;
+            segments.pop_if_empty();
+            for segment in path.split('/') {
+                if matches!(segment, "" | "." | "..") {
+                    bail!("invalid Telegram file path");
+                }
+                segments.push(segment);
+            }
+        }
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(reqwest::Error::without_url)
+            .context("downloading Telegram file")?;
+        if response
+            .content_length()
+            .is_some_and(|size| size > MAX_BYTES as u64)
+        {
+            return Ok(None);
+        }
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(reqwest::Error::without_url)?;
+            if body.len() + chunk.len() > MAX_BYTES {
+                return Ok(None);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(Some(body))
     }
 
     /// Approve/Deny button pressed. Same allow-list as messages: the click is
@@ -154,7 +239,31 @@ impl Tg {
         if !self.permitted(kind, chat_id, user_id) {
             return Ok(());
         }
-        let Some((approve, id)) = cq["data"].as_str().and_then(parse_callback) else {
+        let data = cq["data"].as_str().unwrap_or("");
+        if let Some((action, id)) = data.strip_prefix("code:").and_then(|s| s.split_once(':'))
+            && let Ok(id) = id.parse::<i64>()
+            && matches!(action, "diff" | "accept" | "revise")
+        {
+            if action == "revise" {
+                self.send_plain(
+                    chat_id,
+                    &format!("Отправь /code revise {id} и добавь, что изменить."),
+                )
+                .await?;
+            } else {
+                db.push_event(
+                    "code_action",
+                    &json!({
+                        "chat_id":chat_id, "text":format!("/code {action} {id}")
+                    })
+                    .to_string(),
+                )?;
+            }
+            self.call("answerCallbackQuery", json!({"callback_query_id":cq["id"]}))
+                .await?;
+            return Ok(());
+        }
+        let Some((approve, id)) = parse_callback(data) else {
             return Ok(());
         };
         db.push_event(
@@ -179,14 +288,73 @@ impl Tg {
         Ok(())
     }
 
+    pub async fn send_document(
+        &self,
+        chat_id: i64,
+        filename: &'static str,
+        mime: &str,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        use reqwest::multipart::{Form, Part};
+
+        let file = Part::bytes(bytes).file_name(filename).mime_str(mime)?;
+        let form = Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("document", file);
+        let response: Value = self
+            .http
+            .post(format!("{}/sendDocument", self.base))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?
+            .json()
+            .await
+            .map_err(reqwest::Error::without_url)?;
+        if response["ok"] != true {
+            bail!(
+                "sendDocument: {}",
+                response["description"].as_str().unwrap_or("upload failed")
+            );
+        }
+        Ok(())
+    }
+
     /// Command output is not model markdown: send it literally.
     pub async fn send_plain(&self, chat_id: i64, text: &str) -> Result<()> {
-        for chunk in chunks(text, TG_TEXT_LIMIT) {
-            self.call(
-                "sendMessage",
-                json!({"chat_id": chat_id, "text": chunk, "disable_web_page_preview": true}),
-            )
-            .await?;
+        self.send_plain_with_markup(chat_id, text, None).await
+    }
+
+    pub async fn send_code_result(&self, chat_id: i64, text: &str, id: i64) -> Result<()> {
+        self.send_plain_with_markup(
+            chat_id,
+            text,
+            Some(json!({"inline_keyboard": [[
+                {"text":"Посмотреть diff", "callback_data":format!("code:diff:{id}")},
+                {"text":"Доработать", "callback_data":format!("code:revise:{id}")},
+                {"text":"Принять", "callback_data":format!("code:accept:{id}")},
+            ]]})),
+        )
+        .await
+    }
+
+    async fn send_plain_with_markup(
+        &self,
+        chat_id: i64,
+        text: &str,
+        markup: Option<Value>,
+    ) -> Result<()> {
+        let chunks = chunks(text, TG_TEXT_LIMIT);
+        let last = chunks.len().saturating_sub(1);
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let mut body =
+                json!({"chat_id":chat_id, "text":chunk, "disable_web_page_preview":true});
+            if i == last
+                && let Some(markup) = &markup
+            {
+                body["reply_markup"] = markup.clone();
+            }
+            self.call("sendMessage", body).await?;
         }
         Ok(())
     }
@@ -512,6 +680,7 @@ mod tests {
         Tg {
             http: reqwest::Client::new(),
             base: String::new(),
+            file_base: String::new(),
             allowed_chats: chats.to_vec(),
             allowed_users: users.to_vec(),
         }
@@ -530,6 +699,30 @@ mod tests {
         let old = tg(&[99], &[]);
         assert!(old.permitted("private", 99, 99));
         assert!(!tg(&[], &[]).permitted("private", 99, 99));
+    }
+
+    #[tokio::test]
+    async fn queues_attachments_with_caption_and_largest_photo_for_allowed_chats() {
+        let t = tg(&[], &[42]);
+        let db = Db::open(":memory:").unwrap();
+        let mut update = json!({
+            "message": {
+                "chat": {"id": 42, "type": "group"},
+                "from": {"id": 42},
+                "caption": "Прочитай вывеску",
+                "photo": [{"file_id": "small"}, {"file_id": "large", "file_size": 230}],
+            }
+        });
+        t.on_update(&update, &db).await.unwrap();
+        assert!(db.claim_event().unwrap().is_none());
+        update["message"]["chat"]["type"] = json!("private");
+        t.on_update(&update, &db).await.unwrap();
+        let event = db.claim_event().unwrap().unwrap();
+        let payload: Value = serde_json::from_str(&event.payload).unwrap();
+        assert_eq!(event.kind, "attachment");
+        assert_eq!(payload["text"], "Прочитай вывеску");
+        assert_eq!(payload["attachment"]["id"], "large");
+        assert_eq!(payload["attachment"]["name"], "photo.jpg");
     }
 
     #[test]

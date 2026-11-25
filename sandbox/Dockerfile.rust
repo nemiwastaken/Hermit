@@ -1,0 +1,18 @@
+FROM rust:bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 git ripgrep jq less procps cmake \
+        docx2txt poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus tesseract-ocr-ukr \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY hermit-core/ /app/hermit-core/
+RUN mkdir -p hermit-core/src && touch hermit-core/src/main.rs \
+    && cargo vendor --locked --manifest-path hermit-core/Cargo.toml /opt/hermit-vendor \
+        > /usr/local/cargo/config.toml
+RUN chmod -R a+rX /opt/hermit-vendor
+ENV CARGO_NET_OFFLINE=true
+COPY server.py /app/server.py
+
+ENTRYPOINT ["python3", "-u", "/app/server.py"]
+CMD ["--socket", "/run/hermit/sandbox.sock"]

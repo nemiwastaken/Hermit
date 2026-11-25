@@ -1,0 +1,8 @@
+services:
+  sandbox:
+    environment:
+      HERMIT_HOST_DISK: "1"
+    volumes:
+      - type: bind
+        source: /
+        target: /host

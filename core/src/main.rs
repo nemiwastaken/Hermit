@@ -1,3 +1,4 @@
+mod attachments;
 mod behavior;
 mod cmd;
 mod events;
@@ -12,6 +13,7 @@ mod sandbox;
 mod sched;
 mod telegram;
 
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -33,8 +35,12 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let safe_mode = std::env::args().any(|a| a == "--safe-mode");
     let db_path = env_or("DATABASE_PATH", "./data/hermit.db");
+    let attachment_dir = std::env::var_os("HERMIT_ATTACHMENTS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new(&db_path).with_file_name("attachments"));
     let socket = env_or("SANDBOX_SOCKET", "/opt/hermit/run/sandbox/sandbox.sock");
     let net_socket = env_or("NET_SOCKET", "/opt/hermit/run/net/net.sock");
+    let browser_socket = env_or("BROWSER_SOCKET", "/opt/hermit/run/browser/browser.sock");
     let behavior_dir = env_or("BEHAVIOR_DIR", "./behavior");
 
     let db = Db::open(&db_path)?;
@@ -48,13 +54,20 @@ async fn main() -> Result<()> {
     // MCP discovery runs before Telegram polling with a short timeout so a
     // slow server cannot hold the bot hostage at boot.
     let mcp_net = Sandbox::with_timeout(&net_socket, 15);
-    let initial = mcp::load(&mcp_net).await.unwrap_or_default();
+    let mcp_browser = Sandbox::with_timeout(&browser_socket, 15);
+    let (remote_tools, browser_tools) = tokio::join!(
+        mcp::load(&mcp_net, mcp::Source::Remote),
+        mcp::load(&mcp_browser, mcp::Source::Browser),
+    );
+    let mut initial = remote_tools.unwrap_or_default();
+    initial.extend(browser_tools.unwrap_or_default());
     eprintln!("mcp: {} tool(s)", initial.len());
     let mcp = Arc::new(RwLock::new(initial));
     let agent = Arc::new(Agent {
         llm: llm::Llm::from_env()?,
         tools: Sandbox::new(&socket),
         net,
+        browser: Sandbox::with_timeout(&browser_socket, 60),
         mcp: mcp.clone(),
         db: db.clone(),
         flags: flags.clone(),
@@ -63,22 +76,22 @@ async fn main() -> Result<()> {
     });
 
     eprintln!(
-        "hermit core up: db={db_path} sandbox={socket} net={net_socket} safe_mode={}",
+        "hermit core up: db={db_path} sandbox={socket} net={net_socket} browser={browser_socket} safe_mode={}",
         flags.safe()
     );
 
-    // At boot net may not be listening yet, and `compose restart net` replaces
-    // its list; without this the tools would stay missing or stale forever.
     tokio::spawn(refresh_mcp(
-        mcp,
-        Sandbox::with_timeout(net_socket.clone(), 60),
+        mcp.clone(),
+        Sandbox::with_timeout(net_socket, 60),
+        mcp::Source::Remote,
     ));
+    tokio::spawn(refresh_mcp(mcp, mcp_browser, mcp::Source::Browser));
     let poller = tokio::spawn({
         let tg = tg.clone();
         let db = db.clone();
         async move { tg.poll_forever(db).await }
     });
-    let worker = tokio::spawn(worker(agent, flags, db, tg));
+    let worker = tokio::spawn(worker(agent, flags, db, tg, attachment_dir));
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => eprintln!("ctrl-c, stopping"),
@@ -88,7 +101,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) {
+async fn worker(
+    agent: Arc<Agent>,
+    flags: Arc<Flags>,
+    db: Arc<Db>,
+    tg: Arc<Tg>,
+    attachment_dir: std::path::PathBuf,
+) {
     let mut next_purge = Instant::now();
     let mut next_tick = Instant::now();
     loop {
@@ -110,6 +129,9 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
                     Ok(n) => eprintln!("purged {n} old {label} row(s)"),
                     Err(e) => eprintln!("purge {label}: {e:#}"),
                 }
+            }
+            if let Err(e) = attachments::purge(&attachment_dir) {
+                eprintln!("purge attachments: {e:#}");
             }
             next_purge = Instant::now() + Duration::from_secs(3600);
         }
@@ -146,6 +168,7 @@ async fn worker(agent: Arc<Agent>, flags: Arc<Flags>, db: Arc<Db>, tg: Arc<Tg>) 
         let mut ask_after: Option<String> = None;
         let typing = tg.typing_loop(chat_id);
         let outcome: Result<(String, Option<i64>)> = match ev.kind.as_str() {
+            "attachment" => receive_attachment(&agent, &attachment_dir, ev.id, &payload).await,
             "approval" => {
                 let id = payload["id"].as_i64().unwrap_or(0);
                 let approve = payload["approve"].as_bool().unwrap_or(false);
@@ -230,13 +253,15 @@ async fn send_with_retry(tg: &Tg, chat_id: i64, text: &str, approval: Option<i64
     }
 }
 
-/// Keep the MCP tool list current: net may come up after core, and a config
-/// change only takes effect after `compose restart net`.
-async fn refresh_mcp(mcp: Arc<RwLock<Vec<mcp::McpTool>>>, net: Sandbox) {
+/// Refresh each container independently so it can start or restart after core.
+async fn refresh_mcp(mcp: Arc<RwLock<Vec<mcp::McpTool>>>, socket: Sandbox, source: mcp::Source) {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
-        if let Some(tools) = mcp::load(&net).await {
-            *mcp.write().unwrap_or_else(|e| e.into_inner()) = tools;
+        if let Some(discovered) = mcp::load(&socket, source).await {
+            let mut tools = mcp.write().unwrap_or_else(|e| e.into_inner());
+            tools.retain(|tool| tool.source != source);
+            tools.extend(discovered);
+            tools.sort_by(|a, b| a.name.cmp(&b.name));
         }
     }
 }
@@ -252,6 +277,20 @@ async fn usual(
     event_id: i64,
 ) -> Result<(String, Option<i64>)> {
     match cmd::handle(text, flags, db, chat_id, &agent.behavior_dir) {
+        Some(Cmd::Project(name)) => {
+            tg.send_plain(chat_id, &agent.select_project(chat_id, &name)?)
+                .await?;
+            Ok((String::new(), None))
+        }
+        Some(Cmd::Code(request)) => {
+            let (answer, job) = agent.coding(chat_id, event_id, &request).await?;
+            if let Some(id) = job {
+                tg.send_code_result(chat_id, &answer, id).await?;
+            } else {
+                tg.send_plain(chat_id, &answer).await?;
+            }
+            Ok((String::new(), None))
+        }
         // Data from SQLite and git is not markdown: no bold headings or
         // interpreted asterisks in /memory, /sessions or /usage.
         Some(Cmd::Answer(answer)) => {
@@ -261,8 +300,52 @@ async fn usual(
         Some(Cmd::NewSession) => agent.new_session(chat_id).await.map(|s| (s, None)),
         Some(Cmd::ResumeSession(id)) => agent.resume_session(chat_id, id).await.map(|s| (s, None)),
         Some(Cmd::Compress) => agent.compress(chat_id).await.map(|s| (s, None)),
-        None => agent.reply(event_id, chat_id, text).await,
+        None => agent.reply(event_id, chat_id, text, None).await,
     }
+}
+
+async fn receive_attachment(
+    agent: &Agent,
+    dir: &Path,
+    event_id: i64,
+    payload: &Value,
+) -> Result<(String, Option<i64>)> {
+    let chat_id = payload["chat_id"].as_i64().unwrap_or(0);
+    let caption = payload["text"].as_str().unwrap_or("");
+    let file = serde_json::from_value(payload["attachment"].clone())?;
+    let attached = match attachments::receive(&agent.tg, dir, event_id, &file).await? {
+        Some(attached) => attached,
+        None => return Ok(("Файл превышает лимит загрузки в 20 МБ.".into(), None)),
+    };
+    let is_code = caption.split_whitespace().next().is_some_and(|command| {
+        command
+            .split('@')
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("/code"))
+    });
+    let message = attached
+        .message(
+            caption,
+            (!agent.flags.safe()).then_some(&agent.tools),
+            !is_code && agent.llm.vision(),
+        )
+        .await;
+    if is_code {
+        let request = message.content();
+        return usual(
+            agent,
+            &agent.flags,
+            &agent.db,
+            &agent.tg,
+            chat_id,
+            &request,
+            event_id,
+        )
+        .await;
+    }
+    agent
+        .reply(event_id, chat_id, message.request(), Some(&message))
+        .await
 }
 
 fn env_or(key: &str, default: &str) -> String {

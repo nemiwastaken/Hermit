@@ -496,6 +496,7 @@ mod tests {
         assert!(names.contains("\"memory\"") && names.contains("\"skill\""));
         assert!(names.contains("\"execute_code\""));
         let extra = vec![crate::mcp::McpTool {
+            source: crate::mcp::Source::Remote,
             name: "mcp__demo__echo".into(),
             server: "demo".into(),
             tool: "echo".into(),

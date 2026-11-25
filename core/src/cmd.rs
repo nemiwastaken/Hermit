@@ -29,6 +29,8 @@ impl Flags {
 
 /// What the worker should do with a slash command.
 pub enum Cmd {
+    Project(String),
+    Code(String),
     /// Answered on the spot, no model call.
     Answer(String),
     /// Close the active session into the archive and start a new one.
@@ -52,6 +54,12 @@ pub fn handle(text: &str, flags: &Flags, db: &Db, chat_id: i64, behavior_dir: &s
     let args: Vec<&str> = it.collect();
 
     Some(match cmd.as_str() {
+        "/project" => Cmd::Project(args.join(" ")),
+        "/code" => Cmd::Code(
+            t.split_once(char::is_whitespace)
+                .map_or("", |(_, rest)| rest.trim())
+                .into(),
+        ),
         "/start" | "/help" => Cmd::Answer(HELP.into()),
         "/pause" => {
             if flags.paused() {
@@ -337,6 +345,8 @@ const HELP: &str = "/pause — остановить обработку\n\
 /resume — продолжить\n\
 /safe — выключить инструменты\n\
 /safe off — вернуть инструменты\n\
+/project — выбрать репозиторий для кодинга\n\
+/code — поставить задачу по коду\n\
 /status — очередь, режимы, контекст и архив\n\
 /new — закрыть диалог в архив и начать новый\n\
 /clear — удалить контекст чата, не архивируя\n\
